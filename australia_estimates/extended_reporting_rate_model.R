@@ -1,21 +1,8 @@
-# Ideally would like the number of cases and deaths stratified by whether
-# when detected they were:
-#       - in unsupervised quarantine
-#       - in supervised quarantine
-#       - not in quarantine
-# But more plausibly wee could estimate this by whether they were imports, known
-# contacts, or unknown transmission)
+# time-series estimates of psi
 
-# Estimate variation in the reporting rate between states, using a hierarchical
-# model to share information. Might expect that NSW and Vic are getting overwhelmed.
-# Use number of tests as a covariate?
-
-# get cumulative underestimation parameter for each state from these case data
-# get total number of imports/local/community cases per state from current national sitrep.
-# get split of the 24 deaths between imports/local/community
 
 # probability that a case will have either died or recovered by a given day
-# post-hospotalisation
+# post-hospitalisation
 probability <- function(day, mean_hdt = 13, median_hdt = 9.1) {
   
   # parameters of lognormal delay distribution
@@ -24,33 +11,6 @@ probability <- function(day, mean_hdt = 13, median_hdt = 9.1) {
   
   # probability that the delay between hospitalisation and death is 'day' days
   plnorm(day + 1, mu_hdt, sigma_hdt) - plnorm(day, mu_hdt, sigma_hdt)
-  
-}
-
-# compute the cumulative underestimation correction for CFR
-cumulative_underestimation <- function(daily_cases){
-  
-  total_cases <- sum(daily_cases)
-  
-  # get cases we woud have known about
-  cumulative_known <- 0
-  
-  # Sum over cases up to time tt
-  for(day in seq_along(daily_cases)){
-    
-    known_day <- 0 # number of cases with known outcome at time ii
-    
-    # distribute cases across dayas by which we would know if they died or survived
-    for(delay in 0:(day - 1)){
-      known_delay <- (daily_cases[day - delay]*probability(delay))
-      known_day <- known_day + known_delay
-    }
-    
-    cumulative_known <- cumulative_known + known_day # Tally cumulative known
-  }
-  
-  # underestimation of CFR due to unknown outcomes
-  cumulative_known / total_cases
   
 }
 
@@ -84,16 +44,6 @@ cases_known_outcome <- function(daily_cases){
   
 }
 
-
-# # check this against the cumulative version
-# daily_cases <- rpois(20, exp(1:20/10))
-# for(i in seq_along(daily_cases)) {
-#   daily_cases_sub <- daily_cases[1:i]
-#   new <- sum(cases_known_outcome(daily_cases_sub)) / sum(daily_cases_sub)
-#   old <- cumulative_underestimation(daily_cases_sub)
-#   print(max(abs(new - old)) < 1e-9)
-# }
-
 # download the latest Johns Hopkins data (it's in the package directly, so need to reinstall regularly)
 remotes::install_github("RamiKrispin/coronavirus")
 library(coronavirus)
@@ -105,75 +55,60 @@ aus <- coronavirus %>%
   transmute(state = Province.State, date, count = cases, type) %>%
   group_by(state)
 
+# For each of the states, get the time series of cases, deaths, and expected
+# number of cases with known outcomes (remove any negative cases or deaths).
+aus_timeseries <- aus %>%
+  tidyr::pivot_wider(names_from = type, values_from = count) %>%
+  select(-recovered, cases = confirmed, deaths = death) %>%
+  mutate(cases = pmax(0, cases),
+         deaths = pmax(0, deaths)) %>%
+  mutate(cases_known_outcome = cases_known_outcome(cases))
 
+# get wide form versions of the deaths, and cases with known outcomes
+death_table <- aus_timeseries %>%
+  select(-cases, -cases_known_outcome) %>%
+  tidyr::pivot_wider(names_from = state, values_from = deaths)
 
-# how to handle timesteps with zero cases?
+death_matrix <- death_table %>%
+  select(-date) %>%
+  as.matrix
 
-# This binomial sampling is pretty weird. Instead, we'd want to estimate for a
-# pool of cases whether or not they subsequently died. But we can't do that with
-# integers because we don't have the outcomees for individuals.
+cases_known_table <- aus_timeseries %>%
+  select(-cases, -deaths) %>%
+  tidyr::pivot_wider(names_from = state, values_from = cases_known_outcome)
 
-# Instead, could do the Poisson approximation to the binomial, so that the
-# number of cases with known outcome is the rate.
+cases_known_matrix <- cases_known_table %>%
+  select(-date) %>%
+  as.matrix
 
-#   deaths_t ~ Poisson(cases_known_outcomes * CFR)
-#   cCFR_t = baseline_CFR / psi_t
+# check the dates match
+stopifnot(identical(death_table$date, cases_known_table$date))
 
+# check there are no deaths on days without cases that have known outcomes
+stopif <- function(expr) {stopifnot(!expr)}
+stopif(any(death_matrix > 0 & cases_known_matrix == 0))
 
-
-# get (non-cumulative) known cases at each time t, divide these by the
-# (non-cumulative) cases counts at that time to underestimation at each time t.
-# Them include with contemporary case counts in the following model:
-
-#   deaths_t ~ Binomial(cases_t, nCFR_t)
-#   nCFR_t = cCFR_t * underestimation_t
-#   cCFR_t = baseline_CFR / psi_t
-#   underestimation_t = cases_known_t / cases_t
-
-# rewrite the cases_known estimation method to be non-cumulative, then compute
-# the cumulative sum, and test against the existing implementation.
-
-# write out the greta timeseries model using a sort of hierarchical GP for
-# probit(psi) using greta.gp? same kernel (so only one inversion per iteration),
-# multiple draws (one for each state, plus a national average), then add the
-# national one to each of the others.
-
-# or just have a national-level timeseries?
-# can we include a regression component?
-
-# can be back-calculate a national estimate?
-# weighted sum of psis, using known cases as weights?
-
-
-# given the 
-
-
-# for each state get the total number of cases and deaths
-totals <- aus %>%
-  summarise(total_deaths = sum(count[type == "death"]),
-            total_cases = sum(count[type == "confirmed"]))
-
-# for each state, get the underestimation parameter and append to totals, for use in modelling
-data <- aus %>%
-  left_join(totals) %>%
-  filter(type == "confirmed") %>%
-  summarise(underestimation = cumulative_underestimation(count)) %>%
-  left_join(totals)
+# build model for contemporary observed number of deaths and expected number of
+# deaths:
+#   deaths_t ~ Poisson(expected_deaths_t)
+#   expected_deaths_t = cases_known_outcomes_t * CFR_t
+#   CFR_t = baseline_CFR / psi_t
 
 library(greta)
 
-n <- nrow(data)
+n_states <- ncol(death_matrix)
+n_times <- nrow(death_matrix)
 
 # Distribution over plausible baseline CFR values from China study. The 95% CIs
 # are symmetric around the estimate, so we assume it's a an approximately
 # Gaussian distribution, truncated to allowable values. 
-baseline_cfr <- normal(1.38, 0.077, dim = n, truncation = c(0, 1))
+baseline_cfr_perc <- normal(1.38, 0.077, dim = n_states, truncation = c(0, 1))
 
 # A separate reporting rate for each country, with all reporting rates a priori
 # equally as likely.
 sigma_psi <- normal(0, 1, truncation = c(0, Inf))
 mu_psi <- normal(0, 1)
-z_raw <- normal(0, 1, dim = n)
+z_raw <- normal(0, 1, dim = n_states)
 z <- mu_psi + z_raw * sigma_psi
 psi <- iprobit(z)
 
@@ -181,22 +116,24 @@ psi <- iprobit(z)
 # sim <- calculate(psi[1], nsim = 10000)
 # hist(sim$`psi[1]`)
 
-# Observation model:
-#   total_deaths ~ Poisson(expected_deaths)
-#   expected_deaths = cases_known_outcomes * CFR
-#   CFR = baseline_CFR / psi
-data$cases_known_outcomes <- data$underestimation * data$total_cases
-log_expected_deaths <- log(data$cases_known_outcomes) + log(baseline_cfr) - log(100) - log(psi)
+# expand out psi to matrix, to mock-up temporally-varying model
+log_psi <- log(psi)
+log_psi_t <- sweep(zeros(n_times, n_states), 2, log_psi, "+")
+
+# compute CFR for each state and time
+log_baseline_cfr <- log(baseline_cfr_perc) - log(100)
+log_cfr_t <- sweep(-log_psi_t, 2, log_baseline_cfr, "+")
+
+# define sampling distribution, subsetting to where cases_known_matrix > 0
+# do the exponentiation down here, so greta can use log version in poisson density
+some_cases_known <- which(cases_known_matrix > 0)
+
+log_expected_deaths <- log_cfr_t[some_cases_known] +
+  log(cases_known_matrix)[some_cases_known]
 expected_deaths <- exp(log_expected_deaths)
-distribution(data$total_deaths) <- poisson(expected_deaths)
 
-
-
-# # Observation model. Equivalent to, but more numerically stable than:
-# #   nCFR <- (baseline_cfr / 100) * underestimation / psi
-# log_nCFR <- log(baseline_cfr) - log(100) + log(data$underestimation) - log(psi)
-# nCFR <- exp(log_nCFR)
-# distribution(data$total_deaths) <- binomial(data$total_cases, nCFR)
+observed_deaths <- death_matrix[some_cases_known]
+distribution(observed_deaths) <- poisson(expected_deaths)
 
 set.seed(2020-04-02)
 m <- model(psi)
@@ -207,7 +144,7 @@ coda::gelman.diag(draws)
 sry <- summary(draws)
 
 draws_mat <- as.matrix(draws)
-colnames(draws_mat) <- data$state
+colnames(draws_mat) <- colnames(death_matrix)
 library(bayesplot)
 bayesplot::color_scheme_set("blue")
 bayesplot::mcmc_intervals(draws_mat) + ggplot2::theme_minimal()
