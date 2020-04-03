@@ -1,5 +1,4 @@
-# time-series estimates of psi
-
+# Time-series estimates of reporting rates for Australian states
 
 # probability that a case will have either died or recovered by a given day
 # post-hospitalisation
@@ -99,36 +98,72 @@ library(greta)
 n_states <- ncol(death_matrix)
 n_times <- nrow(death_matrix)
 
+# a timeseries of reporting rates for each state, modelled as hierarchical Gaussian processes
+library(greta.gp)
+
+# squared-exponential GP kernels with unknown parameters for the national and
+# state-level processes
+national_lengthscale_raw <- normal(0, 1, truncation = c(0, Inf))
+national_lengthscale <- national_lengthscale_raw * 100
+national_sigma <- normal(0, 1, truncation = c(0, Inf))
+national_kernel <- rbf(lengthscales = national_lengthscale,
+                       variance = national_sigma ^ 2)
+
+state_lengthscale_raw <- normal(0, 1, truncation = c(0, Inf))
+state_lengthscale <- state_lengthscale_raw * 100
+state_sigma <- normal(0, 1, truncation = c(0, Inf))
+state_kernel <- rbf(lengthscales = state_lengthscale,
+                       variance = state_sigma ^ 2)
+
+# a set of inducing points at which to estimate the GPs (subset of regressors
+# approximation)
+# put an inducing point on the last time point (most recent date), but otherwise
+# space them out
+times <- seq_len(n_times)
+n_inducing <- 10
+inducing_points <- seq(min(times), max(times), length.out = n_inducing + 1)[-1]
+
+tol <- 1e-6
+# GP for the national mean effect
+mu <- greta.gp::gp(times, national_kernel, tol = tol)
+
+# GPs for the state deviations (manually defined as multiple GPs at once isn't
+# yet possible in greta.gp)
+v <- normal(0, 1, dim = c(n_inducing, n_states))
+Kmm <- state_kernel(inducing_points)
+Kmm <- Kmm + diag(n_inducing) * tol
+Lm <- t(chol(Kmm))
+Kmn <- state_kernel(inducing_points, times)
+A <- forwardsolve(Lm, Kmn)
+z_state <- t(A) %*% v
+
+# add the mean effect on
+z <- sweep(z_state, 1, mu, "+")
+
+# convert to probabilities
+psi <- iprobit(z)
+
+# # visualise prior:
+# nsim <- 100
+# sims <- calculate(psi, nsim = nsim)[[1]]
+# plot(sims[1, , 1] ~  times, type = "n", ylim = c(0, 1))
+# for(i in seq_len(nsim)) lines(sims[i, , 1] ~ times, lwd = 0.2)
+
 # Distribution over plausible baseline CFR values from China study. The 95% CIs
 # are symmetric around the estimate, so we assume it's a an approximately
 # Gaussian distribution, truncated to allowable values. 
 baseline_cfr_perc <- normal(1.38, 0.077, dim = n_states, truncation = c(0, 1))
 
-# A separate reporting rate for each country, with all reporting rates a priori
-# equally as likely.
-sigma_psi <- normal(0, 1, truncation = c(0, Inf))
-mu_psi <- normal(0, 1)
-z_raw <- normal(0, 1, dim = n_states)
-z <- mu_psi + z_raw * sigma_psi
-psi <- iprobit(z)
-
-# visualise prior:
-# sim <- calculate(psi[1], nsim = 10000)
-# hist(sim$`psi[1]`)
-
-# expand out psi to matrix, to mock-up temporally-varying model
-log_psi <- log(psi)
-log_psi_t <- sweep(zeros(n_times, n_states), 2, log_psi, "+")
-
 # compute CFR for each state and time
 log_baseline_cfr <- log(baseline_cfr_perc) - log(100)
-log_cfr_t <- sweep(-log_psi_t, 2, log_baseline_cfr, "+")
+log_psi <- log(psi)
+log_cfr <- sweep(-log_psi, 2, log_baseline_cfr, "+")
 
 # define sampling distribution, subsetting to where cases_known_matrix > 0
 # do the exponentiation down here, so greta can use log version in poisson density
 some_cases_known <- which(cases_known_matrix > 0)
 
-log_expected_deaths <- log_cfr_t[some_cases_known] +
+log_expected_deaths <- log_cfr[some_cases_known] +
   log(cases_known_matrix)[some_cases_known]
 expected_deaths <- exp(log_expected_deaths)
 
@@ -136,22 +171,80 @@ observed_deaths <- death_matrix[some_cases_known]
 distribution(observed_deaths) <- poisson(expected_deaths)
 
 set.seed(2020-04-02)
-m <- model(psi)
-draws <- mcmc(m, chains = 10, n_samples = 3000)
+m <- model(national_lengthscale,
+           national_sigma,
+           state_lengthscale,
+           state_sigma)
+draws <- mcmc(m, chains = 10, n_samples = 3000, one_by_one = TRUE)
 
 # check convergence before continuing
 coda::gelman.diag(draws)
-sry <- summary(draws)
+coda::effectiveSize(draws)
 
+png("reporting_rate_timeseries_by_state.png",
+    width = 1200,
+    height = 1800,
+    pointsize = 30)
+par(mfrow = c(4, 2))
+
+state_names <- colnames(death_matrix)
+for (i in seq_len(n_states)) {
+  
+  # subset to the time after the state's first case
+  start <- which(cases_known_matrix[, i] > 0)[1]
+  index <- start:n_times
+  
+  # predict each state's timeseries
+  draws <- calculate(psi[index, i], values = draws)
+  draws_mat <- as.matrix(draws)
+  mean <- colMeans(draws_mat)
+  ci <- apply(draws_mat, 2, quantile, c(0.025, 0.975))
+  iqr <- apply(draws_mat, 2, quantile, c(0.25, 0.75))
+  
+  times_plot <- times[index]
+  # subset times to when this state first saw a case
+  
+  plot(mean ~ times_plot, type = "n",
+       ylim = c(0, 1),
+       xlim = range(times),
+       axes = FALSE, xlab = "date", ylab = "reporting rate")
+  polygon(x = c(times_plot, rev(times_plot)),
+          y = c(ci[1, ], rev(ci[2, ])),
+          col = blues9[2], lty = 0)
+  polygon(x = c(times_plot, rev(times_plot)),
+          y = c(iqr[1, ], rev(iqr[2, ])),
+          col = blues9[3], lty = 0)
+  lines(mean ~ times_plot, lwd = 4, col = blues9[6])
+  axis(2, las = 2)
+  axis(1, at = inducing_points, labels = min(aus_timeseries$date) + inducing_points - 1)
+  
+  title(main = state_names[i])
+  abline(v = times_plot[1], lwd = 1.5, col = "red")
+  text(x = times_plot[1], y = 1.08,
+       labels = "first case reported",
+       xpd = NA, col = "red", cex = 0.8)
+  
+}
+dev.off()
+
+# calculate latest estimates
+draws <- calculate(psi[72, ], values = draws)
 draws_mat <- as.matrix(draws)
-colnames(draws_mat) <- colnames(death_matrix)
+colnames(draws_mat) <- state_names
 library(bayesplot)
+library(ggplot2)
 bayesplot::color_scheme_set("blue")
-bayesplot::mcmc_intervals(draws_mat) + ggplot2::theme_minimal()
+bayesplot::mcmc_intervals(draws_mat, point_est = "mean", prob = 0.5, prob_outer = 0.95) +
+  ggplot2::xlim(0, 1) +
+  ggplot2::theme_minimal() +
+  ggplot2::ggtitle(paste("estimated reporting rates on",
+                         max(aus_timeseries$date)))
+ggplot2::ggsave("latest_reporting_rates.png", scale = 0.8)
 
-reporting_rate <- data.frame(estimate = colMeans(draws_mat),
-                             lower = apply(draws_mat, 2, quantile, 0.025),
-                             upper = apply(draws_mat, 2, quantile, 0.975))
-
+reporting_rate <- data.frame(mean = colMeans(draws_mat),
+                             lower_50 = apply(draws_mat, 2, quantile, 0.25),
+                             upper_50 = apply(draws_mat, 2, quantile, 0.75),
+                             lower_95 = apply(draws_mat, 2, quantile, 0.025),
+                             upper_95 = apply(draws_mat, 2, quantile, 0.975))
 
 knitr::kable(round(reporting_rate, 3))
