@@ -44,7 +44,7 @@ cases_known_outcome <- function(daily_cases){
 }
 
 # download the latest Johns Hopkins data (it's in the package directly, so need to reinstall regularly)
-remotes::install_github("RamiKrispin/coronavirus")
+remotes::install_github("RamiKrispin/coronavirus", upgrade = "never")
 library(coronavirus)
 
 # subset the data to Aus states
@@ -101,19 +101,18 @@ n_times <- nrow(death_matrix)
 # a timeseries of reporting rates for each state, modelled as hierarchical Gaussian processes
 library(greta.gp)
 
-# squared-exponential GP kernels with unknown parameters for the national and
-# state-level processes
-national_lengthscale_raw <- normal(0, 1, truncation = c(0, Inf))
-national_lengthscale <- national_lengthscale_raw * 100
-national_sigma <- normal(0, 1, truncation = c(0, Inf))
+# squared-exponential GP kernels (plus intercepts) with unknown parameters for the national and
+# state-level processes. lognormal prior for lengthscales to reduce prior
+# probability hof high temporal change
+national_lengthscale <- lognormal(4, 0.5)
+national_sigma <- normal(0, 0.5, truncation = c(0, Inf))
 national_kernel <- rbf(lengthscales = national_lengthscale,
-                       variance = national_sigma ^ 2)
+                       variance = national_sigma ^ 2) + bias(0.5)
 
-state_lengthscale_raw <- normal(0, 1, truncation = c(0, Inf))
-state_lengthscale <- state_lengthscale_raw * 100
-state_sigma <- normal(0, 1, truncation = c(0, Inf))
+state_lengthscale <- lognormal(4, 0.5)
+state_sigma <- normal(0, 0.5, truncation = c(0, Inf))
 state_kernel <- rbf(lengthscales = state_lengthscale,
-                       variance = state_sigma ^ 2)
+                       variance = state_sigma ^ 2) + bias(0.5)
 
 # a set of inducing points at which to estimate the GPs (subset of regressors
 # approximation)
@@ -144,7 +143,7 @@ z <- sweep(z_state, 1, mu, "+")
 psi <- iprobit(z)
 
 # # visualise prior:
-# nsim <- 100
+# nsim <- 300
 # sims <- calculate(psi, nsim = nsim)[[1]]
 # plot(sims[1, , 1] ~  times, type = "n", ylim = c(0, 1))
 # for(i in seq_len(nsim)) lines(sims[i, , 1] ~ times, lwd = 0.2)
@@ -175,7 +174,7 @@ m <- model(national_lengthscale,
            national_sigma,
            state_lengthscale,
            state_sigma)
-draws <- mcmc(m, chains = 10, n_samples = 3000, one_by_one = TRUE)
+draws <- mcmc(m, chains = 30, n_samples = 1000, one_by_one = TRUE)
 
 # check convergence before continuing
 coda::gelman.diag(draws)
@@ -216,7 +215,9 @@ for (i in seq_len(n_states)) {
           col = blues9[3], lty = 0)
   lines(mean ~ times_plot, lwd = 4, col = blues9[6])
   axis(2, las = 2)
-  axis(1, at = inducing_points, labels = min(aus_timeseries$date) + inducing_points - 1)
+  # subtract 13 days from dates to reflect the date at which symptomatic would
+  # have been detected
+  axis(1, at = inducing_points, labels = min(aus_timeseries$date - 13) + inducing_points - 1)
   
   title(main = state_names[i])
   abline(v = times_plot[1], lwd = 1.5, col = "red")
@@ -228,7 +229,7 @@ for (i in seq_len(n_states)) {
 dev.off()
 
 # calculate latest estimates
-draws <- calculate(psi[72, ], values = draws)
+draws <- calculate(psi[n_times, ], values = draws)
 draws_mat <- as.matrix(draws)
 colnames(draws_mat) <- state_names
 library(bayesplot)
@@ -237,9 +238,10 @@ bayesplot::color_scheme_set("blue")
 bayesplot::mcmc_intervals(draws_mat, point_est = "mean", prob = 0.5, prob_outer = 0.95) +
   ggplot2::xlim(0, 1) +
   ggplot2::theme_minimal() +
-  ggplot2::ggtitle(paste("estimated reporting rates on",
-                         max(aus_timeseries$date)))
-ggplot2::ggsave("latest_reporting_rates.png", scale = 0.8)
+  ggplot2::ggtitle(paste("estimated reporting rates for symptomatic cases\non",
+                         max(aus_timeseries$date - 13),
+                         "(the latest available data)"))
+ggplot2::ggsave("latest_reporting_rates.png", scale = 1)
 
 reporting_rate <- data.frame(mean = colMeans(draws_mat),
                              lower_50 = apply(draws_mat, 2, quantile, 0.25),
@@ -247,4 +249,7 @@ reporting_rate <- data.frame(mean = colMeans(draws_mat),
                              lower_95 = apply(draws_mat, 2, quantile, 0.025),
                              upper_95 = apply(draws_mat, 2, quantile, 0.975))
 
+write.csv(reporting_rate,
+          "latest_reporting_rates.csv",
+          row.names = FALSE)
 knitr::kable(round(reporting_rate, 3))
