@@ -166,6 +166,52 @@ log_expected_deaths <- log_cfr[some_cases_known] +
   log(cases_known_matrix)[some_cases_known]
 expected_deaths <- exp(log_expected_deaths)
 
+# first, just split out overseas imports.
+
+# expected number of deaths is CFR * cases_known, where cases_known is the total
+# number of cases with known outcomes by this time, given by the number of known
+# imports + the number of non-imports divided by the reporting rate (since we
+# assume that the detection is now perfect for overseas imports)
+
+# expected_deaths = true_cfr * (known_imports + known_local_cases / reporting_rate)
+
+
+
+
+# in the more general case:
+
+# elementwise divide the matrix of known cases with known outcomes in each state
+# andcase type at each time by the reporting rate for each state and case type
+# for each time. Then sum over rows to get the modelled total 'true' number of
+# cases.
+
+# expected_deaths = true_cfr * aggregation_matrix %*% t(known_cases_matrix / reporting_rate_matrix)
+
+# where both known_cases_matrix and reporting_rate_matrix are matrices with
+# n_times x (n_states * n_types), and aggregation_matrix if a matrix of 1s and
+# 0s that sums over the types of cases within each state:
+
+# e.g.:
+# n_states <- 7
+# n_types <- 5
+# n_times <- 3
+# states <- rep(seq_len(n_states), each = n_types)
+# types <- rep(seq_len(n_types), n_states)
+# x <- matrix(rnorm(n_times * n_states * n_types), nrow = n_times)
+# 
+# aggregation <- outer(seq_len(n_states), states, FUN = "==")
+# aggregation[] <- as.integer(aggregation)
+# res <- aggregation %*% t(x)
+# 
+# # sanity check
+# tapply(x[1, ], states, FUN = "sum")
+# tapply(x[2, ], states, FUN = "sum")
+# tapply(x[3, ], states, FUN = "sum")
+
+# need to also to define probit-normal priors on the mean reporting rates for
+# different types, and apply these as normal priors on the intercept term (add
+# the mean, and use a bias kernel) (intercept).
+
 observed_deaths <- death_matrix[some_cases_known]
 distribution(observed_deaths) <- poisson(expected_deaths)
 
