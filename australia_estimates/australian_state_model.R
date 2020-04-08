@@ -101,18 +101,28 @@ n_times <- nrow(death_matrix)
 # a timeseries of reporting rates for each state, modelled as hierarchical Gaussian processes
 library(greta.gp)
 
-# squared-exponential GP kernels (plus intercepts) with unknown parameters for the national and
-# state-level processes. lognormal prior for lengthscales to reduce prior
-# probability hof high temporal change
+# squared-exponential GP kernels (plus intercepts) with unknown parameters for
+# the national and state-level processes. lognormal prior for lengthscales to
+# reduce prior probability hof high temporal change
 national_lengthscale <- lognormal(4, 0.5)
 national_sigma <- lognormal(-1, 1)
-national_kernel <- rbf(lengthscales = national_lengthscale,
-                       variance = national_sigma ^ 2) + bias(0.5)
+national_temporal <- rbf(lengthscales = national_lengthscale,
+                         variance = national_sigma ^ 2)
+national_intercept <- bias(0.5)
+national_kernel <- national_intercept + national_temporal
 
 state_lengthscale <- lognormal(4, 0.5)
 state_sigma <- lognormal(-1, 1)
-state_kernel <- rbf(lengthscales = state_lengthscale,
-                       variance = state_sigma ^ 2) + bias(0.5)
+state_temporal <- rbf(lengthscales = state_lengthscale,
+                       variance = state_sigma ^ 2)
+state_intercept <- bias(0.5)
+state_kernel <- state_intercept + state_temporal
+
+# IID gaussian kernel to represent observation error (overdispersion)
+sigma_obs <- normal(0, 0.5, truncation = c(0, Inf))
+observation_kernel <- white(sigma_obs ^ 2)
+
+state_observed_kernel <- state_kernel + observation_kernel
 
 # a set of inducing points at which to estimate the GPs (subset of regressors
 # approximation)
@@ -122,17 +132,16 @@ times <- seq_len(n_times)
 n_inducing <- 5
 inducing_points <- seq(min(times), max(times), length.out = n_inducing + 1)[-1]
 
+# GP for the national mean effect - add jitter to help with matrix inversion
 tol <- 1e-6
-# GP for the national mean effect
 mu <- greta.gp::gp(times, inducing = inducing_points, national_kernel, tol = tol)
 
 # GPs for the state deviations (manually defined as multiple GPs at once isn't
 # yet possible in greta.gp)
 v <- normal(0, 1, dim = c(n_inducing, n_states))
-Kmm <- state_kernel(inducing_points)
-Kmm <- Kmm + diag(n_inducing) * tol
+Kmm <- state_observed_kernel(inducing_points)
 Lm <- t(chol(Kmm))
-Kmn <- state_kernel(inducing_points, times)
+Kmn <- state_observed_kernel(inducing_points, times)
 A <- forwardsolve(Lm, Kmn)
 z_state <- t(A) %*% v
 
@@ -148,12 +157,12 @@ reporting_rate <- iprobit(z)
 # plot(sims[1, , 1] ~  times, type = "n", ylim = c(0, 1))
 # for(i in seq_len(nsim)) lines(sims[i, , 1] ~ times, lwd = 0.2)
 
-true_cfr_mean <- 1.38
-true_cfr_sigma <- 0.077
 
 # Distribution over plausible baseline CFR values from China study. The 95% CIs
 # are symmetric around the estimate, so we assume it's a an approximately
 # Gaussian distribution, truncated to allowable values. 
+true_cfr_mean <- 1.38
+true_cfr_sigma <- 0.077
 baseline_cfr_perc <- normal(true_cfr_mean, true_cfr_sigma, dim = n_states, truncation = c(0, 100))
 
 # compute CFR for each state and time
@@ -251,11 +260,23 @@ n_eff <- coda::effectiveSize(draws)
 max(r_hats)
 min(n_eff)
 
+# now compute reporting rates *without* additional observation error (possible
+# overdispersion due to clumped death rates)
+Kmm_smooth <- state_kernel(inducing_points)
+Lm_smooth <- t(chol(Kmm_smooth))
+Kmn_smooth <- state_kernel(inducing_points, times)
+A_smooth <- forwardsolve(Lm_smooth, Kmn_smooth)
+z_state_smooth <- t(A_smooth) %*% v
+z_smooth <- sweep(z_state_smooth, 1, mu, "+")
+reporting_rate_smooth <- iprobit(z_smooth)
+
+
 png("reporting_rate_timeseries_by_state.png",
     width = 1200,
     height = 1800,
     pointsize = 30)
-par(mfrow = c(4, 2))
+par(mfrow = c(4, 2),
+    mar = c(5, 4, 4, 3))
 
 state_names <- colnames(death_matrix)
 for (i in seq_len(n_states)) {
@@ -265,7 +286,7 @@ for (i in seq_len(n_states)) {
   index <- start:n_times
   
   # predict each state's timeseries
-  draws <- calculate(reporting_rate[index, i], values = draws)
+  draws <- calculate(reporting_rate_smooth[index, i], values = draws)
   draws_mat <- as.matrix(draws)
   mean <- colMeans(draws_mat)
   ci <- apply(draws_mat, 2, quantile, c(0.025, 0.975))
@@ -277,7 +298,9 @@ for (i in seq_len(n_states)) {
   plot(mean ~ times_plot, type = "n",
        ylim = c(0, 1),
        xlim = range(times),
-       axes = FALSE, xlab = "date", ylab = "reporting rate")
+       axes = FALSE,
+       xlab = "date of symptomatic case report",
+       ylab = "probability of detection")
   polygon(x = c(times_plot, rev(times_plot)),
           y = c(ci[1, ], rev(ci[2, ])),
           col = blues9[2], lty = 0)
@@ -286,9 +309,13 @@ for (i in seq_len(n_states)) {
           col = blues9[3], lty = 0)
   lines(mean ~ times_plot, lwd = 4, col = blues9[6])
   axis(2, las = 2)
+  
   # subtract 13 days from dates to reflect the date at which symptomatic would
   # have been detected
-  axis(1, at = inducing_points, labels = min(aus_timeseries$date - 13) + inducing_points - 1)
+  first_date <- min(aus_timeseries$date - 13)
+  
+  axis(1, at = inducing_points, labels = first_date + inducing_points - 1)
+  
   
   title(main = state_names[i])
   abline(v = times_plot[1], lwd = 1.5, col = "red")
@@ -296,11 +323,20 @@ for (i in seq_len(n_states)) {
        labels = "first case reported",
        xpd = NA, col = "red", cex = 0.8)
   
+  # add dates of recorded deaths in upper rug plot 
+  death_times <- times_plot[death_matrix[times_plot, i] > 0]
+  if (length(death_times) > 0) {
+    rug(death_times, side = 1, lwd = 2)
+    text(x = max(times_plot), y = -0.02,
+         labels = "deaths",pos = 4,
+         xpd = NA, cex = 0.8)
+  }
+  
 }
 dev.off()
 
 # calculate latest estimates
-draws <- calculate(reporting_rate[n_times, ], values = draws)
+draws <- calculate(reporting_rate_smooth[n_times, ], values = draws)
 draws_mat <- as.matrix(draws)
 colnames(draws_mat) <- state_names
 library(bayesplot)
@@ -324,3 +360,12 @@ write.csv(reporting_rate,
           "latest_reporting_rates.csv",
           row.names = FALSE)
 knitr::kable(round(reporting_rate, 3))
+
+# compute a national estimate
+weights <- colSums(cases_known_matrix)
+weights <- weights / sum(weights)
+national_reporting_rate_estimate <- reporting_rate_smooth %*% as.matrix(weights)
+draws_national <- calculate(national_reporting_rate_estimate[n_times], values = draws)
+draws_national_vec <- as.matrix(draws_national)[, 1]
+c(mean = mean(draws_national_vec), quantile(draws_national_vec, c(0.25, 0.75, 0.025, 0.975)))
+
