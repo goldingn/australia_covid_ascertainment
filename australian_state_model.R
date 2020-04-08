@@ -25,6 +25,10 @@ cases_known_outcome <- function(daily_cases){
   # effective number of cases we would have known about
   cases_known <- rep(0, n_days)
   
+  # temporarily omit NAs when filling these in
+  missing <- is.na(daily_cases)
+  daily_cases[missing] <- 0 
+  
   # disaggregate these cases across subsequent days
   for(day in days){
     
@@ -39,209 +43,292 @@ cases_known_outcome <- function(daily_cases){
     
   }
   
+  cases_known[missing] <- NA
   cases_known
   
+}
+
+# build a circulant matrix of prob, with masked lower values, then
+# matrix-multiply a date-by-state matrix of daily cases to get the cases with
+# known cases on that date
+cases_known_outcome_matrix <- function (daily_cases) {
+  
+  n_days <- NROW(daily_cases)
+  days <- seq_len(n_days)
+  
+  # get a probability of delaying each of these number of days (starting from 0)
+  delay_probs <- probability(days - 1)
+  
+  # build an upper-triangular circulant matrix (contribution of each day's cases
+  # to each other's)
+  mat <- matrix(0, n_days, n_days)
+  indices <- col(mat) - row(mat) + 1
+  mask <- indices > 0
+  mat[mask] <- delay_probs[indices[mask]]
+  
+  # matrix-multiply to disaggregate them
+  t(mat) %*% daily_cases
+  
+}
+
+# fit a Subset-of-Regressors-approximated hierarchical GP with rbf + bias
+# kernels for both the mean and states
+hierarchical_gp <- function (times,
+                             n_states,
+                             lengthscale_mu,
+                             lengthscale_z,
+                             sigma_mu,
+                             sigma_z,
+                             sigma_mu_intercept = 0.7,
+                             sigma_z_intercept = 0.7,
+                             n_inducing = 5,
+                             tol = 1e-4) {
+  
+  # GP kernels
+  kernel_mu <-
+    rbf(lengthscales = lengthscale_mu, variance = sigma_mu ^ 2) +
+    bias(sigma_mu_intercept ^ 2)
+  
+  kernel_z <-
+    rbf(lengthscales = lengthscale_z, variance = sigma_z ^ 2) + 
+    bias(sigma_z_intercept ^ 2)
+  
+  # inducing points  
+  inducing_points <- seq(min(times), max(times), length.out = n_inducing + 1)[-1]
+  
+  # mean GP
+  mu <- greta.gp::gp(times, inducing = inducing_points, kernel_mu, tol = tol)
+  
+  # GPs for the states deviations (manually defined as multiple GPs at once isn't
+  # yet possible in greta.gp)
+  v <- normal(0, 1, dim = c(n_inducing, n_states))
+  Kmm <- kernel_z(inducing_points)
+  Kmm <- Kmm + diag(n_inducing) * tol
+  Lm <- t(chol(Kmm))
+  Kmn <- kernel_z(inducing_points, times)
+  A <- forwardsolve(Lm, Kmn)
+  z_devations <- t(A) %*% v
+  
+  # add the mean effect onto the deviations and return
+  sweep(z_devations, 1, mu, "+")
+  
+}
+
+# default hyperpriors for hierarchical GPs
+default_hypers <- function() {
+  list(lengthscale_mu = lognormal(4, 0.5),
+       lengthscale_z = lognormal(4, 0.5),
+       sigma_mu = lognormal(-1, 1),
+       sigma_z = lognormal(-1, 1)
+  )
+}
+
+# get date-by-state matrix of 'var' from data
+date_state_matrix <- function(var, data) {
+  matrix <- data %>%
+    select(state, date, !!var) %>%
+    tidyr::pivot_wider(names_from = state, values_from = !!var) %>%
+    select(-date) %>%
+    as.matrix
+  rownames(matrix) <- as.character(unique(data$date))
+  matrix
+}
+
+# given a 'recipient' matrix with some missing values, fill in the missing
+# values with the corresponding elements in the 'donor' matrix of the same
+# dimensions, multiplied by the scalar 'correction' factor (e.g. a probabilisitc
+# reassignment)
+impute_values <- function(recipient, donor, correction) {
+  missing <- which(is.na(recipient), arr.ind = TRUE)
+  recipient[missing] <- 0
+  recipient <- as_data(recipient)
+  recipient[missing] <- donor[missing] * correction
+  recipient
 }
 
 # download the latest Johns Hopkins data (it's in the package directly, so need to reinstall regularly)
 remotes::install_github("RamiKrispin/coronavirus", upgrade = "never")
 library(coronavirus)
 
-# subset the data to Aus states
+# load data from covid19data.org.au (scraped by Chris Baker) with cases by
+# source for some states.
+source("load_data.R")
+source_data <- load_data()
+
+# subset the case data to Aus states
 library(dplyr)
 aus <- coronavirus %>%
   filter(Country.Region == "Australia") %>%
   transmute(state = Province.State, date, count = cases, type) %>%
   group_by(state)
 
-# For each of the states, get the time series of cases, deaths, and expected
-# number of cases with known outcomes (remove any negative cases or deaths).
+# expand the type of count for each state, attach the sources where known, and
+# compute cases with known outcomes
 aus_timeseries <- aus %>%
   tidyr::pivot_wider(names_from = type, values_from = count) %>%
   select(-recovered, cases = confirmed, deaths = death) %>%
   mutate(cases = pmax(0, cases),
          deaths = pmax(0, deaths)) %>%
-  mutate(cases_known_outcome = cases_known_outcome(cases))
+  left_join(source_data)
 
-# get wide form versions of the deaths, and cases with known outcomes
-death_table <- aus_timeseries %>%
-  select(-cases, -cases_known_outcome) %>%
-  tidyr::pivot_wider(names_from = state, values_from = deaths)
+# get date-by-state matrices for daily case counts by state for each source
 
-death_matrix <- death_table %>%
-  select(-date) %>%
-  as.matrix
+# deaths and all cases (as in Johns Hopkins data)
+deaths <- date_state_matrix("deaths", aus_timeseries)
+cases <- date_state_matrix("cases", aus_timeseries)
 
-cases_known_table <- aus_timeseries %>%
-  select(-cases, -deaths) %>%
-  tidyr::pivot_wider(names_from = state, values_from = cases_known_outcome)
+# cases from each source, with some NAs
+unknown_local <- date_state_matrix("unknown_local", aus_timeseries)
+known_local <- date_state_matrix("known_local", aus_timeseries)
+overseas <- date_state_matrix("overseas", aus_timeseries)
+other <- date_state_matrix("other", aus_timeseries)
 
-cases_known_matrix <- cases_known_table %>%
-  select(-date) %>%
-  as.matrix
+# impute missing values
 
-# check the dates match
-stopifnot(identical(death_table$date, cases_known_table$date))
+# where no information is available (Queensland, or outside dates when sources
+# were reported), disaggregate into the fraction that are local with unknown
+# source and those that are 'other'; then disaggregate the 'other' into those
+# that are overseas-acquired, vs. local with known source. For WA, 'other' is
+# known, so just the second step.
 
-# check there are no deaths on days without cases that have known outcomes
-stopif <- function(expr) {stopifnot(!expr)}
-stopif(any(death_matrix > 0 & cases_known_matrix == 0))
-
-# build model for contemporary observed number of deaths and expected number of
-# deaths:
-#   deaths_t ~ Poisson(expected_deaths_t)
-#   expected_deaths_t = cases_known_outcomes_t * CFR_t
-#   CFR_t = baseline_CFR / reporting_rate_t
-
-library(greta)
-
-n_states <- ncol(death_matrix)
-n_times <- nrow(death_matrix)
-
-# a timeseries of reporting rates for each state, modelled as hierarchical Gaussian processes
 library(greta.gp)
 
-# squared-exponential GP kernels (plus intercepts) with unknown parameters for
-# the national and state-level processes. lognormal prior for lengthscales to
-# reduce prior probability hof high temporal change
-national_lengthscale <- lognormal(4, 0.5)
-national_sigma <- lognormal(-1, 1)
-national_temporal <- rbf(lengthscales = national_lengthscale,
-                         variance = national_sigma ^ 2)
-national_intercept <- bias(0.5)
-national_kernel <- national_intercept + national_temporal
+p_other_is_overseas <- uniform(0, 1)
+p_all_is_unknown_local <- uniform(0, 1)
 
-state_lengthscale <- lognormal(4, 0.5)
-state_sigma <- lognormal(-1, 1)
-state_temporal <- rbf(lengthscales = state_lengthscale,
-                       variance = state_sigma ^ 2)
-state_intercept <- bias(0.5)
-state_kernel <- state_intercept + state_temporal
+# fill in values
+unknown_local <- impute_values(unknown_local, cases, p_all_is_unknown_local)
+other <- impute_values(other, cases, 1 - p_all_is_unknown_local)
+overseas <- impute_values(overseas, other, p_other_is_overseas)
+known_local <- impute_values(known_local, other, 1 - p_other_is_overseas)
 
-# IID gaussian kernel to represent observation error (overdispersion)
-sigma_obs <- normal(0, 0.5, truncation = c(0, Inf))
-observation_kernel <- white(sigma_obs ^ 2)
+# inform those parameters with data
+overseas_vs_other <- aus_timeseries %>%
+  ungroup %>%
+  select(overseas, known_local) %>%
+  na.omit() %>%
+  mutate(other = overseas + known_local) %>%
+  summarise(successes = sum(overseas),
+            trials = sum(other))
 
-state_observed_kernel <- state_kernel + observation_kernel
+distribution(overseas_vs_other$successes) <- binomial(overseas_vs_other$trials, p_other_is_overseas)
 
-# a set of inducing points at which to estimate the GPs (subset of regressors
-# approximation)
-# put an inducing point on the last time point (most recent date), but otherwise
-# space them out
+unknown_local_vs_all <- aus_timeseries %>%
+  ungroup %>%
+  select(unknown_local, cases) %>%
+  na.omit() %>%
+  summarise(successes = sum(unknown_local),
+            trials = sum(cases))
+
+distribution(unknown_local_vs_all$successes) <- binomial(unknown_local_vs_all$trials, p_all_is_unknown_local)
+
+# now disaggregate these cases using the delay distribution
+unknown_local <- cases_known_outcome_matrix(unknown_local)
+known_local <- cases_known_outcome_matrix(known_local)
+overseas <- cases_known_outcome_matrix(overseas)
+
+n_states <- ncol(deaths)
+n_times <- nrow(deaths)
 times <- seq_len(n_times)
-n_inducing <- 5
-inducing_points <- seq(min(times), max(times), length.out = n_inducing + 1)[-1]
 
-# GP for the national mean effect - add jitter to help with matrix inversion
-tol <- 1e-6
-mu <- greta.gp::gp(times, inducing = inducing_points, national_kernel, tol = tol)
 
-# GPs for the state deviations (manually defined as multiple GPs at once isn't
-# yet possible in greta.gp)
-v <- normal(0, 1, dim = c(n_inducing, n_states))
-Kmm <- state_observed_kernel(inducing_points)
-Lm <- t(chol(Kmm))
-Kmn <- state_observed_kernel(inducing_points, times)
-A <- forwardsolve(Lm, Kmn)
-z_state <- t(A) %*% v
+# define hierarchical probit-GPs for reporting rates of unknown local, and known
+# local cases. Assume reporting rate for overseas-acquired cases is perfect.
 
-# add the mean effect on
-z <- sweep(z_state, 1, mu, "+")
+unknown_local_hypers <- default_hypers()
+unknown_local_reporting_z <- hierarchical_gp(
+  times = times,
+  n_states = n_states,
+  lengthscale_mu = unknown_local_hypers$lengthscale_mu,
+  lengthscale_z = unknown_local_hypers$lengthscale_z,
+  sigma_mu = unknown_local_hypers$sigma_mu,
+  sigma_z = unknown_local_hypers$sigma_z
+)
+unknown_local_reporting <- iprobit(unknown_local_reporting_z)
 
-# convert to probabilities
-reporting_rate <- iprobit(z)
+known_local_hypers <- default_hypers()
+known_local_reporting_z <- hierarchical_gp(
+  times = times,
+  n_states = n_states,
+  lengthscale_mu = known_local_hypers$lengthscale_mu,
+  lengthscale_z = known_local_hypers$lengthscale_z,
+  sigma_mu = known_local_hypers$sigma_mu,
+  sigma_z = known_local_hypers$sigma_z
+)
+known_local_reporting <- iprobit(known_local_reporting_z)
 
-# # visualise prior:
+overseas_reporting <- ones(n_times, n_states)
+
+# # visualise priors:
 # nsim <- 300
-# sims <- calculate(reporting_rate, nsim = nsim)[[1]]
+# sims <- calculate(unknown_local_reporting[, 1], nsim = nsim)[[1]]
 # plot(sims[1, , 1] ~  times, type = "n", ylim = c(0, 1))
 # for(i in seq_len(nsim)) lines(sims[i, , 1] ~ times, lwd = 0.2)
 
+# divide the reported cases by the reporting rates to get the expected total
+# number of of cases in each source/state/time, then sum to get the expected
+# total in each state/time
+overseas_total_cases <- overseas / overseas_reporting
+known_local_total_cases <- known_local / known_local_reporting
+unknown_local_total_cases <- unknown_local / unknown_local_reporting
+total_cases <- overseas_total_cases + known_local_total_cases + unknown_local_total_cases
 
 # Distribution over plausible baseline CFR values from China study. The 95% CIs
 # are symmetric around the estimate, so we assume it's a an approximately
-# Gaussian distribution, truncated to allowable values. 
+# Gaussian distribution, truncated to allowable values. Define separately for each state
 true_cfr_mean <- 1.38
 true_cfr_sigma <- 0.077
 baseline_cfr_perc <- normal(true_cfr_mean, true_cfr_sigma, dim = n_states, truncation = c(0, 100))
 
-# compute CFR for each state and time
 log_baseline_cfr <- log(baseline_cfr_perc) - log(100)
-log_reporting_rate <- log(reporting_rate)
-log_cfr <- sweep(-log_reporting_rate, 2, log_baseline_cfr, "+")
+# expected deaths each state and time (divide percentage by 100 to get fraction)
+log_expected_deaths <- sweep(log(total_cases), 2, log_baseline_cfr, FUN = "*")
 
 # define sampling distribution, subsetting to where cases_known_matrix > 0
 # do the exponentiation down here, so greta can use log version in poisson density
-some_cases_known <- which(cases_known_matrix > 0)
-
-log_expected_deaths <- log_cfr[some_cases_known] +
-  log(cases_known_matrix)[some_cases_known]
-expected_deaths <- exp(log_expected_deaths)
-
-# first, just split out overseas imports.
-
-# expected number of deaths is CFR * cases_known, where cases_known is the total
-# number of cases with known outcomes by this time, given by the number of known
-# imports + the number of non-imports divided by the reporting rate (since we
-# assume that the detection is now perfect for overseas imports)
-
-# expected_deaths = true_cfr * (known_imports + known_local_cases / reporting_rate)
-
-
-
-
-# in the more general case:
-
-# elementwise divide the matrix of known cases with known outcomes in each state
-# andcase type at each time by the reporting rate for each state and case type
-# for each time. Then sum over rows to get the modelled total 'true' number of
-# cases.
-
-# expected_deaths = true_cfr * aggregation_matrix %*% t(known_cases_matrix / reporting_rate_matrix)
-
-# where both known_cases_matrix and reporting_rate_matrix are matrices with
-# n_times x (n_states * n_types), and aggregation_matrix if a matrix of 1s and
-# 0s that sums over the types of cases within each state:
-
-# e.g.:
-# n_states <- 7
-# n_types <- 5
-# n_times <- 3
-# states <- rep(seq_len(n_states), each = n_types)
-# types <- rep(seq_len(n_types), n_states)
-# x <- matrix(rnorm(n_times * n_states * n_types), nrow = n_times)
-# 
-# aggregation <- outer(seq_len(n_states), states, FUN = "==")
-# aggregation[] <- as.integer(aggregation)
-# res <- aggregation %*% t(x)
-# 
-# # sanity check
-# tapply(x[1, ], states, FUN = "sum")
-# tapply(x[2, ], states, FUN = "sum")
-# tapply(x[3, ], states, FUN = "sum")
-
-# need to also to define probit-normal priors on the mean reporting rates for
-# different types, and apply these as normal priors on the intercept term (add
-# the mean, and use a bias kernel) (intercept).
-
-observed_deaths <- death_matrix[some_cases_known]
+some_cases_known <- which(cases > 0)
+expected_deaths <- exp(log_expected_deaths[some_cases_known])
+observed_deaths <- deaths[some_cases_known]
 distribution(observed_deaths) <- poisson(expected_deaths)
 
+unknown_local_hypers_lengthscale_mu <- unknown_local_hypers$lengthscale_mu
+unknown_local_hypers_lengthscale_z <- unknown_local_hypers$lengthscale_z
+unknown_local_hypers_sigma_mu <- unknown_local_hypers$sigma_mu
+unknown_local_hypers_sigma_z <- unknown_local_hypers$sigma_z
+known_local_hypers_lengthscale_mu <- known_local_hypers$lengthscale_mu
+known_local_hypers_lengthscale_z <- known_local_hypers$lengthscale_z
+known_local_hypers_sigma_mu <- known_local_hypers$sigma_mu
+known_local_hypers_sigma_z <- known_local_hypers$sigma_z
+
 set.seed(2020-04-02)
-m <- model(reporting_rate)
+m <- model(unknown_local_hypers_lengthscale_mu,
+           unknown_local_hypers_lengthscale_z,
+           unknown_local_hypers_sigma_mu,
+           unknown_local_hypers_sigma_z,
+           known_local_hypers_lengthscale_mu,
+           known_local_hypers_lengthscale_z,
+           known_local_hypers_sigma_mu,
+           known_local_hypers_sigma_z)
 
-n_chains <- 50
+n_chains <- 5
 
+# samplin initial values for hyperparameters from their priors
 inits <- replicate(
   n_chains,
   initials(
-    national_lengthscale = rlnorm(1, 4, 0.5),
-    national_sigma = rlnorm(1, -1, 1),
-    state_lengthscale = rlnorm(1, 4, 0.5),
-    state_sigma = rlnorm(1, -1, 1),
-    baseline_cfr_perc = max(0.001, min(99.999,
-                                       rnorm(1, true_cfr_mean, true_cfr_sigma)
-    ))
+    unknown_local_hypers_lengthscale_mu = rlnorm(1, 4, 0.5),
+    unknown_local_hypers_lengthscale_z = rlnorm(1, 4, 0.5),
+    unknown_local_hypers_sigma_mu = rlnorm(1, -1, 1),
+    unknown_local_hypers_sigma_z = rlnorm(1, -1, 1),
+    known_local_hypers_lengthscale_mu = rlnorm(1, 4, 0.5),
+    known_local_hypers_lengthscale_z = rlnorm(1, 4, 0.5),
+    known_local_hypers_sigma_mu = rlnorm(1, -1, 1),
+    known_local_hypers_sigma_z = rlnorm(1, -1, 1),
+    baseline_cfr_perc = pmax(0.001,
+                             pmin(99.999, 
+                                  rnorm(n_states, true_cfr_mean, true_cfr_sigma)
+                                  )
+                             )
   ),
   simplify = FALSE
 )
@@ -251,6 +338,7 @@ draws <- mcmc(
   sampler = hmc(Lmin = 15, Lmax = 20),
   chains = n_chains,
   n_samples = 1000,
+  initial_values = inits,
   one_by_one = TRUE
 )
 
@@ -260,15 +348,20 @@ n_eff <- coda::effectiveSize(draws)
 max(r_hats)
 min(n_eff)
 
-# now compute reporting rates *without* additional observation error (possible
-# overdispersion due to clumped death rates)
-Kmm_smooth <- state_kernel(inducing_points)
-Lm_smooth <- t(chol(Kmm_smooth))
-Kmn_smooth <- state_kernel(inducing_points, times)
-A_smooth <- forwardsolve(Lm_smooth, Kmn_smooth)
-z_state_smooth <- t(A_smooth) %*% v
-z_smooth <- sweep(z_state_smooth, 1, mu, "+")
-reporting_rate_smooth <- iprobit(z_smooth)
+
+
+# compute the ratio of total to observed cases in state and nationally, and trace these
+total_cases_detected <- overseas + known_local + unknown_local
+
+# overall reporting rate (all sources), by state and nationwide
+combined_reporting <- total_cases_detected / total_cases
+combined_reporting_national <- rowSums(total_cases_detected) / rowSums(total_cases)
+
+# reporting rates for each source nationwide
+unknown_local_reporting_national <- rowSums(unknown_local_total_cases) / rowSums(unknown_local)
+known_local_reporting_national <- rowSums(known_local_total_cases) / rowSums(known_local)
+
+
 
 
 png("reporting_rate_timeseries_by_state.png",
