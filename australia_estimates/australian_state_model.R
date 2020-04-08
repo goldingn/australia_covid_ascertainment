@@ -91,7 +91,7 @@ stopif(any(death_matrix > 0 & cases_known_matrix == 0))
 # deaths:
 #   deaths_t ~ Poisson(expected_deaths_t)
 #   expected_deaths_t = cases_known_outcomes_t * CFR_t
-#   CFR_t = baseline_CFR / psi_t
+#   CFR_t = baseline_CFR / reporting_rate_t
 
 library(greta)
 
@@ -105,12 +105,12 @@ library(greta.gp)
 # state-level processes. lognormal prior for lengthscales to reduce prior
 # probability hof high temporal change
 national_lengthscale <- lognormal(4, 0.5)
-national_sigma <- normal(0, 0.5, truncation = c(0, Inf))
+national_sigma <- lognormal(-1, 1)
 national_kernel <- rbf(lengthscales = national_lengthscale,
                        variance = national_sigma ^ 2) + bias(0.5)
 
 state_lengthscale <- lognormal(4, 0.5)
-state_sigma <- normal(0, 0.5, truncation = c(0, Inf))
+state_sigma <- lognormal(-1, 1)
 state_kernel <- rbf(lengthscales = state_lengthscale,
                        variance = state_sigma ^ 2) + bias(0.5)
 
@@ -119,12 +119,12 @@ state_kernel <- rbf(lengthscales = state_lengthscale,
 # put an inducing point on the last time point (most recent date), but otherwise
 # space them out
 times <- seq_len(n_times)
-n_inducing <- 10
+n_inducing <- 5
 inducing_points <- seq(min(times), max(times), length.out = n_inducing + 1)[-1]
 
 tol <- 1e-6
 # GP for the national mean effect
-mu <- greta.gp::gp(times, national_kernel, tol = tol)
+mu <- greta.gp::gp(times, inducing = inducing_points, national_kernel, tol = tol)
 
 # GPs for the state deviations (manually defined as multiple GPs at once isn't
 # yet possible in greta.gp)
@@ -140,23 +140,26 @@ z_state <- t(A) %*% v
 z <- sweep(z_state, 1, mu, "+")
 
 # convert to probabilities
-psi <- iprobit(z)
+reporting_rate <- iprobit(z)
 
 # # visualise prior:
 # nsim <- 300
-# sims <- calculate(psi, nsim = nsim)[[1]]
+# sims <- calculate(reporting_rate, nsim = nsim)[[1]]
 # plot(sims[1, , 1] ~  times, type = "n", ylim = c(0, 1))
 # for(i in seq_len(nsim)) lines(sims[i, , 1] ~ times, lwd = 0.2)
+
+true_cfr_mean <- 1.38
+true_cfr_sigma <- 0.077
 
 # Distribution over plausible baseline CFR values from China study. The 95% CIs
 # are symmetric around the estimate, so we assume it's a an approximately
 # Gaussian distribution, truncated to allowable values. 
-baseline_cfr_perc <- normal(1.38, 0.077, dim = n_states, truncation = c(0, 1))
+baseline_cfr_perc <- normal(true_cfr_mean, true_cfr_sigma, dim = n_states, truncation = c(0, 100))
 
 # compute CFR for each state and time
 log_baseline_cfr <- log(baseline_cfr_perc) - log(100)
-log_psi <- log(psi)
-log_cfr <- sweep(-log_psi, 2, log_baseline_cfr, "+")
+log_reporting_rate <- log(reporting_rate)
+log_cfr <- sweep(-log_reporting_rate, 2, log_baseline_cfr, "+")
 
 # define sampling distribution, subsetting to where cases_known_matrix > 0
 # do the exponentiation down here, so greta can use log version in poisson density
@@ -216,15 +219,37 @@ observed_deaths <- death_matrix[some_cases_known]
 distribution(observed_deaths) <- poisson(expected_deaths)
 
 set.seed(2020-04-02)
-m <- model(national_lengthscale,
-           national_sigma,
-           state_lengthscale,
-           state_sigma)
-draws <- mcmc(m, chains = 30, n_samples = 1000, one_by_one = TRUE)
+m <- model(reporting_rate)
+
+n_chains <- 50
+
+inits <- replicate(
+  n_chains,
+  initials(
+    national_lengthscale = rlnorm(1, 4, 0.5),
+    national_sigma = rlnorm(1, -1, 1),
+    state_lengthscale = rlnorm(1, 4, 0.5),
+    state_sigma = rlnorm(1, -1, 1),
+    baseline_cfr_perc = max(0.001, min(99.999,
+                                       rnorm(1, true_cfr_mean, true_cfr_sigma)
+    ))
+  ),
+  simplify = FALSE
+)
+
+draws <- mcmc(
+  m,
+  sampler = hmc(Lmin = 15, Lmax = 20),
+  chains = n_chains,
+  n_samples = 1000,
+  one_by_one = TRUE
+)
 
 # check convergence before continuing
-coda::gelman.diag(draws)
-coda::effectiveSize(draws)
+r_hats <- coda::gelman.diag(draws, autoburnin = FALSE, multivariate = FALSE)$psrf[, 1]
+n_eff <- coda::effectiveSize(draws)
+max(r_hats)
+min(n_eff)
 
 png("reporting_rate_timeseries_by_state.png",
     width = 1200,
@@ -240,7 +265,7 @@ for (i in seq_len(n_states)) {
   index <- start:n_times
   
   # predict each state's timeseries
-  draws <- calculate(psi[index, i], values = draws)
+  draws <- calculate(reporting_rate[index, i], values = draws)
   draws_mat <- as.matrix(draws)
   mean <- colMeans(draws_mat)
   ci <- apply(draws_mat, 2, quantile, c(0.025, 0.975))
@@ -275,7 +300,7 @@ for (i in seq_len(n_states)) {
 dev.off()
 
 # calculate latest estimates
-draws <- calculate(psi[n_times, ], values = draws)
+draws <- calculate(reporting_rate[n_times, ], values = draws)
 draws_mat <- as.matrix(draws)
 colnames(draws_mat) <- state_names
 library(bayesplot)
