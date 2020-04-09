@@ -167,6 +167,22 @@ date_state_matrix <- function(var, data) {
   matrix
 }
 
+# given date-by-state matrices of the observed number of cases and the reporting
+# rates, compute a national average of the reporting rate
+national_average <- function (reporting_rate, observed_cases) {
+  
+  # compute state weights from timeseries totals on the number of observed cases
+  total_cases <- observed_cases / reporting_rate
+  total_cases_sum <- colSums(total_cases)
+  state_weights <- total_cases_sum / sum(total_cases_sum)
+  
+  # compute weights only where there are some observed cases, so we can compute
+  # row sums in state_weights
+  weighted <- sweep(reporting_rate, 2, state_weights, FUN = "*")
+  rowSums(weighted)
+  
+}
+
 # download the latest Johns Hopkins data (it's in the package directly, so need to reinstall regularly)
 remotes::install_github("RamiKrispin/coronavirus", upgrade = "never")
 library(coronavirus)
@@ -269,7 +285,8 @@ unknown_local_intercepts <- unknown_local_intercepts_raw * unknown_local_sigma
 unknown_local_gp <- temporal_gp(
   times = times,
   lengthscale = unknown_local_gp_lengthscale,
-  sigma = unknown_local_gp_sigma
+  sigma = unknown_local_gp_sigma,
+  tol = 0
 )
 unknown_local_z <- kronecker(
   unknown_local_gp,
@@ -288,7 +305,8 @@ known_diff_intercepts <- known_diff_intercepts_raw * known_diff_sigma
 known_diff_gp <- temporal_gp(
   times = times,
   lengthscale = known_diff_gp_lengthscale,
-  sigma = known_diff_gp_sigma
+  sigma = known_diff_gp_sigma,
+  tol = 0
 )
 known_diff_z <- kronecker(
   known_diff_gp,
@@ -369,29 +387,64 @@ n_eff <- coda::effectiveSize(draws)
 max(r_hats)
 min(n_eff)
 
-# compute different ascertainment rates
-# some of these will have non-finite values because of missing data (no cases with known outcomes)
-# find a better way of computing them?
-overseas_total_cases_all <- overseas / overseas_reporting
-known_local_total_cases_all <- known_local / known_local_reporting
-unknown_local_total_cases_all <- unknown_local / unknown_local_reporting
-total_cases_all <- overseas_total_cases_all + known_local_total_cases_all + unknown_local_total_cases_all
+# compute different ascertainment rate from all sources, and compute a national aggregate
+# want:
+#  - national-level timeseries by source (including 'all')
+#  - latest point estimates by state and source (including 'all')
 
-# compute the ratio of total to observed cases in state and nationally, and trace these
-total_cases_detected <- overseas + known_local + unknown_local
+# compute weights based on timeseries totals not contemporary totals, since the
+# timeseries totals have too many zeros and are causing all sorts of numerical
+# issues
 
-# overall reporting rate (all sources), by state and nationwide
-combined_reporting <- total_cases_detected / total_cases_all
-combined_reporting_national <- rowSums(total_cases_detected) / rowSums(total_cases_all)
+# reported cases from all sources
+all_sources <- overseas + known_local + unknown_local
 
-# reporting rates for each source nationwide
-unknown_local_reporting_national <- rowSums(unknown_local) / rowSums(unknown_local_total_cases_all)
-known_local_reporting_national <- rowSums(known_local) / rowSums(known_local_total_cases_all)
+# true number of cases from each and all sources
+overseas_total <- colSums(overseas / overseas_reporting)
+known_local_total <- colSums(known_local / known_local_reporting)
+unknown_local_total <- colSums(unknown_local / unknown_local_reporting)
+all_sources_total <- overseas_total + known_local_total + unknown_local_total
 
-unknown_local_reporting_national_draws <- calculate(unknown_local_reporting_national, values = draws)
-unknown_local_reporting_national_draws_mat <- as.matrix(unknown_local_reporting_national_draws)
-plot(colMeans(unknown_local_reporting_national_draws_mat) ~ times, type = "l", ylim = c(0, 1))
-lines(apply(unknown_local_reporting_national_draws_mat, 1, quantile, 0.025), lty = 2)
+# fraction of true number of cases from each source, within each state
+overseas_weight <- overseas_total / all_sources_total
+known_local_weight <- known_local_total / all_sources_total
+unknown_local_weight <- unknown_local_total / all_sources_total 
+
+# reporting rate for all sources
+all_sources_reporting <-
+  sweep(overseas_reporting, 2, overseas_weight, FUN = "*") + 
+  sweep(known_local_reporting, 2, known_local_weight, FUN = "*") + 
+  sweep(unknown_local_reporting, 2, unknown_local_weight, FUN = "*")
+
+# timeseries of national averages for each source
+unknown_local_reporting_nat <- national_average(unknown_local_reporting, unknown_local)
+known_local_reporting_nat <- national_average(known_local_reporting, known_local)
+all_sources_reporting_nat <- national_average(all_sources_reporting, all_sources)
+
+# contemporary estimates of reporting rates in each state, and by each source
+unknown_local_reporting_latest <- unknown_local_reporting[n_times, ]
+known_local_reporting_latest <- known_local_reporting[n_times, ]
+all_sources_reporting_latest <- all_sources_reporting[n_times, ]
+
+# 
+# 
+# 
+# # summarise (posterior mean and 95% CI) and plot a single vector greta array as
+# # a timeseries
+# plot_ts <- function (ts, draws) {
+#   draws_pred <- calculate(ts, values = draws)
+#   draws_mat <- as.matrix(draws_pred)
+#   mn <- colMeans(draws_mat)
+#   not_missing <- !is.na(mn)
+#   quants <- apply(draws_mat[, not_missing], 2, quantile, c(0.025, 0.975))
+#   plot(mn[not_missing] ~ times[not_missing], type = "l", ylim = c(0, 1))
+#   lines(quants[1, ] ~ times[not_missing], lty = 2)
+#   lines(quants[2, ] ~ times[not_missing], lty = 2)
+# }
+# 
+# plot_ts(unknown_local_reporting_nat, draws)
+# plot_ts(known_local_reporting_nat, draws)
+# plot_ts(all_sources_reporting_nat, draws)
 
 png("reporting_rate_timeseries_by_state.png",
     width = 1200,
@@ -400,22 +453,36 @@ png("reporting_rate_timeseries_by_state.png",
 par(mfrow = c(4, 2),
     mar = c(5, 4, 4, 3))
 
-state_names <- colnames(death_matrix)
+# givena  vector greta array for a timeseries of values, return the posterior
+# mean, 95% credible interval, and posterior interquartile range
+summarise_timeseries <- function(ts, draws) {
+  draws <- calculate(ts, values = draws)
+  draws_mat <- as.matrix(draws)
+  list(
+    mean = colMeans(draws_mat),
+    ci = apply(draws_mat, 2, quantile, c(0.025, 0.975)),
+    iqr = apply(draws_mat, 2, quantile, c(0.25, 0.75))
+  )
+}
+
+
+state_names <- colnames(deaths)
 for (i in seq_len(n_states)) {
   
   # subset to the time after the state's first case
-  start <- which(cases_known_matrix[, i] > 0)[1]
+  start <- which(known_cases_vals[, i] > 0)[1]
   index <- start:n_times
-  
-  # predict each state's timeseries
-  draws <- calculate(reporting_rate_smooth[index, i], values = draws)
-  draws_mat <- as.matrix(draws)
-  mean <- colMeans(draws_mat)
-  ci <- apply(draws_mat, 2, quantile, c(0.025, 0.975))
-  iqr <- apply(draws_mat, 2, quantile, c(0.25, 0.75))
-  
   times_plot <- times[index]
-  # subset times to when this state first saw a case
+  
+  # predict each state's timeseries for the all-sources reporting rate
+  all_sources_sry <- summarise_timeseries(
+    all_sources_reporting[index, i],
+    draws
+  )
+
+  mean <- all_sources_sry$mean
+  ci <- all_sources_sry$ci
+  iqr <- all_sources_sry$iqr
   
   plot(mean ~ times_plot, type = "n",
        ylim = c(0, 1),
@@ -435,8 +502,8 @@ for (i in seq_len(n_states)) {
   # subtract 13 days from dates to reflect the date at which symptomatic would
   # have been detected
   first_date <- min(aus_timeseries$date - 13)
-  
-  axis(1, at = inducing_points, labels = first_date + inducing_points - 1)
+  times_axis <- seq(1, n_times, length.out = 5)
+  axis(1, at = times_axis, labels = first_date + times_axis - 1)
   
   
   title(main = state_names[i])
@@ -446,7 +513,7 @@ for (i in seq_len(n_states)) {
        xpd = NA, col = "red", cex = 0.8)
   
   # add dates of recorded deaths in upper rug plot 
-  death_times <- times_plot[death_matrix[times_plot, i] > 0]
+  death_times <- times_plot[deaths[times_plot, i] > 0]
   if (length(death_times) > 0) {
     rug(death_times, side = 1, lwd = 2)
     text(x = max(times_plot), y = -0.02,
