@@ -98,23 +98,24 @@ hierarchical_gp <- function (times,
                              n_inducing = 5,
                              tol = 1e-4) {
   
-  # GP kernels
-  kernel_mu <-
-    rbf(lengthscales = lengthscale_mu, variance = sigma_mu ^ 2) +
-    bias(sigma_mu_intercept ^ 2)
+  # mean GP
+  mu <- temporal_gp(
+    times = times,
+    lengthscale = lengthscale_mu,
+    sigma = sigma_mu,
+    sigma_intercept = sigma_mu_intercept,
+    n_inducing = n_inducing,
+    tol = tol
+  )
   
+  # GPs for the states deviations (manually defined because multiple GPs from
+  # the same kernel isn't yet possible in greta.gp)
   kernel_z <-
     rbf(lengthscales = lengthscale_z, variance = sigma_z ^ 2) + 
     bias(sigma_z_intercept ^ 2)
   
-  # inducing points  
   inducing_points <- seq(min(times), max(times), length.out = n_inducing + 1)[-1]
   
-  # mean GP
-  mu <- greta.gp::gp(times, inducing = inducing_points, kernel_mu, tol = tol)
-  
-  # GPs for the states deviations (manually defined as multiple GPs at once isn't
-  # yet possible in greta.gp)
   v <- normal(0, 1, dim = c(n_inducing, n_states))
   Kmm <- kernel_z(inducing_points)
   Kmm <- Kmm + diag(n_inducing) * tol
@@ -218,8 +219,8 @@ library(greta.gp)
 # large there's essentially no uncertainty on them. Could relax the model a bit
 # later (e.g. hierarchical model by state on the proportions), and infer them
 
-# p_other_is_overseas <- uniform(0, 1)
-# p_all_is_unknown_local <- uniform(0, 1)
+p_other_is_overseas <- uniform(0, 1)
+p_all_is_unknown_local <- uniform(0, 1)
 
 overseas_vs_other <- aus_timeseries %>%
   ungroup %>%
@@ -229,9 +230,8 @@ overseas_vs_other <- aus_timeseries %>%
   summarise(successes = sum(overseas),
             trials = sum(other))
 
-# distribution(overseas_vs_other$successes) <- binomial(overseas_vs_other$trials, p_other_is_overseas)
-
-p_other_is_overseas <- overseas_vs_other$successes / overseas_vs_other$trials
+distribution(overseas_vs_other$successes) <- binomial(overseas_vs_other$trials, p_other_is_overseas)
+# p_other_is_overseas <- overseas_vs_other$successes / overseas_vs_other$trials
 
 unknown_local_vs_all <- aus_timeseries %>%
   ungroup %>%
@@ -240,8 +240,8 @@ unknown_local_vs_all <- aus_timeseries %>%
   summarise(successes = sum(unknown_local),
             trials = sum(cases))
 
-# distribution(unknown_local_vs_all$successes) <- binomial(unknown_local_vs_all$trials, p_all_is_unknown_local)
-p_all_is_unknown_local <- unknown_local_vs_all$successes / unknown_local_vs_all$trials
+distribution(unknown_local_vs_all$successes) <- binomial(unknown_local_vs_all$trials, p_all_is_unknown_local)
+# p_all_is_unknown_local <- unknown_local_vs_all$successes / unknown_local_vs_all$trials
 
 # fill in values
 unknown_local <- impute_values(unknown_local, cases, p_all_is_unknown_local)
@@ -261,15 +261,6 @@ times <- seq_len(n_times)
 # define hierarchical probit-GPs for reporting rates of unknown local, and known
 # local cases. Assume reporting rate for overseas-acquired cases is perfect.
 
-# unknown_local_hypers <- default_hypers()
-# unknown_local_reporting_z <- hierarchical_gp(
-#   times = times,
-#   n_states = n_states,
-#   lengthscale_mu = unknown_local_hypers$lengthscale_mu,
-#   lengthscale_z = unknown_local_hypers$lengthscale_z,
-#   sigma_mu = unknown_local_hypers$sigma_mu,
-#   sigma_z = unknown_local_hypers$sigma_z
-# )
 unknown_local_gp_lengthscale <- lognormal(4, 0.5)
 unknown_local_gp_sigma <- lognormal(-2, 0.5)
 unknown_local_sigma <- normal(0, 0.5, truncation = c(0, Inf))
@@ -287,30 +278,26 @@ unknown_local_z <- kronecker(
 )
 unknown_local_reporting <- iprobit(unknown_local_z)
 
-# known_local_hypers <- default_hypers()
-# known_local_reporting_z <- hierarchical_gp(
-#   times = times,
-#   n_states = n_states,
-#   lengthscale_mu = known_local_hypers$lengthscale_mu,
-#   lengthscale_z = known_local_hypers$lengthscale_z,
-#   sigma_mu = known_local_hypers$sigma_mu,
-#   sigma_z = known_local_hypers$sigma_z
-# )
-known_local_gp_lengthscale <- lognormal(4, 0.5)
-known_local_gp_sigma <- lognormal(-2, 0.5)
-known_local_sigma <- normal(0, 0.5, truncation = c(0, Inf))
-known_local_intercepts_raw <- normal(0, 1, dim = n_states)
-known_local_intercepts <- known_local_intercepts_raw * known_local_sigma
-known_local_gp <- temporal_gp(
+# model the difference between these two, to decorrelate them, and so that
+# shrinkage is towards no difference
+known_diff_gp_lengthscale <- lognormal(4, 0.5)
+known_diff_gp_sigma <- lognormal(-2, 0.5)
+known_diff_sigma <- normal(0, 0.5, truncation = c(0, Inf))
+known_diff_intercepts_raw <- normal(0, 1, dim = n_states)
+known_diff_intercepts <- known_diff_intercepts_raw * known_diff_sigma
+known_diff_gp <- temporal_gp(
   times = times,
-  lengthscale = known_local_gp_lengthscale,
-  sigma = known_local_gp_sigma
+  lengthscale = known_diff_gp_lengthscale,
+  sigma = known_diff_gp_sigma
 )
-known_local_z <- kronecker(
-  known_local_gp,
-  t(known_local_intercepts),
+known_diff_z <- kronecker(
+  known_diff_gp,
+  t(known_diff_intercepts),
   FUN = "+"
 )
+
+# combine them to get probit-reporting rate for known locals
+known_local_z <- unknown_local_z + known_diff_z
 known_local_reporting <- iprobit(known_local_z)
 
 overseas_reporting <- ones(n_times, n_states)
@@ -324,8 +311,13 @@ overseas_reporting <- ones(n_times, n_states)
 
 # find zeros in the imputed daily case counts, so we can skip them
 # this needs to happen here for some reason
-known_cases <- (overseas + unknown_local + known_local) > 0
-some_cases_known <- which(known_cases > 0)
+known_cases <- (overseas + unknown_local + known_local)
+known_cases_vals <- calculate(known_cases,
+                              values = list(
+                                p_all_is_unknown_local = 0.5,
+                                p_other_is_overseas = 0.5
+                              ))[[1]]
+some_cases_known <- which(known_cases_vals > 0)
 
 # divide the reported cases by the reporting rates to get the expected total
 # number of of cases in each source/state/time, then sum to get the expected
@@ -357,9 +349,9 @@ m <- model(
   unknown_local_gp_lengthscale,
   unknown_local_gp_sigma,
   unknown_local_sigma,
-  known_local_gp_lengthscale,
-  known_local_gp_sigma,
-  known_local_sigma
+  known_diff_gp_lengthscale,
+  known_diff_gp_sigma,
+  known_diff_sigma
 )
 
 n_chains <- 10
@@ -368,7 +360,6 @@ draws <- mcmc(
   m,
   chains = n_chains,
   n_samples = 1000,
-  # initial_values = inits,
   one_by_one = TRUE
 )
 
