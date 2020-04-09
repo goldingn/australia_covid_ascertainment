@@ -5,13 +5,20 @@
 # dimensions, multiplied by the scalar 'correction' factor (e.g. a probabilisitc
 # reassignment)
 impute_values <- function(recipient, donor, correction) {
+  
   missing <- which(is.na(recipient), arr.ind = TRUE)
   if(inherits(correction, "greta_array")) {
     recipient[missing] <- 0  
     recipient <- as_data(recipient)
   }
-  recipient[missing] <- donor[missing] * correction
+  
+  # create a matrix of the correction factors to subset
+  blank <- zeros(nrow(donor), ncol(donor))
+  correction_mat <- sweep(blank, 2, correction, FUN = "+")
+  
+  recipient[missing] <- donor[missing] * correction_mat[missing]
   recipient
+  
 }
 
 # probability that a case will have either died or recovered by a given day
@@ -183,6 +190,99 @@ national_average <- function (reporting_rate, observed_cases) {
   
 }
 
+# given a greta array, return the posterior mean, 95% credible interval, and
+# posterior interquartile range
+summarise_samples <- function(ts, draws) {
+  draws <- calculate(ts, values = draws)
+  draws_mat <- as.matrix(draws)
+  list(
+    mean = colMeans(draws_mat),
+    ci = apply(draws_mat, 2, quantile, c(0.025, 0.975)),
+    iqr = apply(draws_mat, 2, quantile, c(0.25, 0.75))
+  )
+}
+
+plot_timeseries <- function(summary, title = NULL, death_times = c()) {
+  
+  mean <- summary$mean
+  ci <- summary$ci
+  iqr <- summary$iqr
+  
+  plot(mean ~ times, type = "n",
+       ylim = c(0, 1),
+       xlim = range(times),
+       axes = FALSE,
+       xlab = "date of symptomatic case report",
+       ylab = "probability of detection")
+  polygon(x = c(times, rev(times)),
+          y = c(ci[1, ], rev(ci[2, ])),
+          col = blues9[2], lty = 0)
+  polygon(x = c(times, rev(times)),
+          y = c(iqr[1, ], rev(iqr[2, ])),
+          col = blues9[3], lty = 0)
+  lines(mean ~ times, lwd = 4, col = blues9[6])
+  axis(2, las = 2)
+  
+  # subtract 13 days from dates to reflect the date at which symptomatic would
+  # have been detected
+  first_date <- min(aus_timeseries$date - 13)
+  times_axis <- seq(1, n_times, length.out = 5)
+  axis(1, at = times_axis, labels = first_date + times_axis - 1,
+       cex.axis = 0.8)
+  
+  title(main = title)
+  
+  # add dates of recorded deaths in lower rug plot 
+  
+  if (length(death_times) > 0) {
+    rug(death_times, side = 1, lwd = 1)
+    text(x = max(times), y = -0.02,
+         labels = "deaths",pos = 4,
+         xpd = NA, cex = 0.8)
+  }
+  
+}
+
+format_summary <- function (summary) {
+  df <- data.frame(
+    state = colnames(deaths),
+    mean = summary$mean,
+    lower_50 = summary$iqr[1, ],
+    upper_50 = summary$iqr[2, ],
+    lower_95 = summary$ci[1, ],
+    upper_95 = summary$ci[2, ]
+  )
+  rownames(df) <- NULL
+  df
+}
+
+forest_plot <- function (summary, title, labels = TRUE) {
+  
+  df <- format_summary(summary)
+  
+  require(ggplot2)
+  
+  p <- ggplot(data = df, aes(x = state, y = mean, ymin = lower_95, ymax = upper_95)) +
+    geom_linerange(col = blues9[4], size = 1.5) +
+    geom_linerange(aes(ymin = lower_50, ymax = upper_50), size = 2.5, col =  blues9[6]) +
+    geom_point(col = blues9[9], size = 3) + 
+    coord_flip() +
+    scale_x_discrete(limits = rev(levels(df$state))) +
+    ylim(0, 1) +
+    ylab("probability of detection") +
+    xlab("") +
+    ggtitle(title[[1]], subtitle = title[[2]]) + 
+    geom_hline(yintercept = c(0, 1), col = grey(0.5)) +
+    theme_minimal()
+  
+  if(!labels) {
+    p <- p + theme(axis.text.y = element_blank())
+  }
+  
+  p
+  
+}
+
 # download the latest Johns Hopkins data (it's in the package directly, so need to reinstall regularly)
 remotes::install_github("RamiKrispin/coronavirus", upgrade = "never")
 library(coronavirus)
@@ -231,33 +331,58 @@ other <- date_state_matrix("other", aus_timeseries)
 
 library(greta.gp)
 
+n_states <- ncol(deaths)
+n_times <- nrow(deaths)
+times <- seq_len(n_times)
+
+
 # estimating those parameters directly as with this model, the numbers are so
 # large there's essentially no uncertainty on them. Could relax the model a bit
 # later (e.g. hierarchical model by state on the proportions), and infer them
 
-p_other_is_overseas <- uniform(0, 1)
-p_all_is_unknown_local <- uniform(0, 1)
+other_is_overseas_sigma <- normal(0, 0.5, truncation = c(0, Inf))
+other_is_overseas_mean <- normal(0, sqrt(0.5))
+other_is_overseas_raw <- normal(0, 1, dim = n_states)
+other_is_overseas_z <- other_is_overseas_mean + other_is_overseas_raw * other_is_overseas_sigma
+p_other_is_overseas <- iprobit(other_is_overseas_z)
+
+# # check prior on probability (slightly convex is fine, strong 'U' shape not so
+# # good)
+# hist(calculate(p_other_is_overseas[1], nsim = 10000)[[1]], breaks = 100)
+
+all_is_unknown_local_sigma <- normal(0, 0.5, truncation = c(0, Inf))
+all_is_unknown_local_mean <- normal(0, sqrt(0.5))
+all_is_unknown_local_raw <- normal(0, 1, dim = n_states)
+all_is_unknown_local_z <- all_is_unknown_local_mean + all_is_unknown_local_raw * all_is_unknown_local_sigma
+p_all_is_unknown_local <- iprobit(all_is_unknown_local_z)
+
+# get data to inform these, skipping some states for whichthere is no data
+state_names <- tibble::tibble(state = colnames(deaths))
 
 overseas_vs_other <- aus_timeseries %>%
-  ungroup %>%
   select(overseas, known_local) %>%
   na.omit() %>%
   mutate(other = overseas + known_local) %>%
   summarise(successes = sum(overseas),
-            trials = sum(other))
+            trials = sum(other)) %>%
+  right_join(state_names)
 
-distribution(overseas_vs_other$successes) <- binomial(overseas_vs_other$trials, p_other_is_overseas)
-# p_other_is_overseas <- overseas_vs_other$successes / overseas_vs_other$trials
+not_missing <- which(!is.na(overseas_vs_other$trials))
+distribution(overseas_vs_other$successes[not_missing]) <-
+  binomial(overseas_vs_other$trials[not_missing],
+           p_other_is_overseas[not_missing])
 
 unknown_local_vs_all <- aus_timeseries %>%
-  ungroup %>%
   select(unknown_local, cases) %>%
   na.omit() %>%
   summarise(successes = sum(unknown_local),
-            trials = sum(cases))
+            trials = sum(cases)) %>%
+  right_join(state_names)
 
-distribution(unknown_local_vs_all$successes) <- binomial(unknown_local_vs_all$trials, p_all_is_unknown_local)
-# p_all_is_unknown_local <- unknown_local_vs_all$successes / unknown_local_vs_all$trials
+not_missing <- which(!is.na(unknown_local_vs_all$trials))
+distribution(unknown_local_vs_all$successes[not_missing]) <-
+  binomial(unknown_local_vs_all$trials[not_missing],
+           p_all_is_unknown_local[not_missing])
 
 # fill in values
 unknown_local <- impute_values(unknown_local, cases, p_all_is_unknown_local)
@@ -269,10 +394,6 @@ known_local <- impute_values(known_local, other, 1 - p_other_is_overseas)
 unknown_local <- cases_known_outcome_matrix(unknown_local)
 known_local <- cases_known_outcome_matrix(known_local)
 overseas <- cases_known_outcome_matrix(overseas)
-
-n_states <- ncol(deaths)
-n_times <- nrow(deaths)
-times <- seq_len(n_times)
 
 # define hierarchical probit-GPs for reporting rates of unknown local, and known
 # local cases. Assume reporting rate for overseas-acquired cases is perfect.
@@ -328,12 +449,11 @@ overseas_reporting <- ones(n_times, n_states)
 # for(i in seq_len(nsim)) lines(sims[i, , 1] ~ times, lwd = 0.2)
 
 # find zeros in the imputed daily case counts, so we can skip them
-# this needs to happen here for some reason
 known_cases <- (overseas + unknown_local + known_local)
 known_cases_vals <- calculate(known_cases,
                               values = list(
-                                p_all_is_unknown_local = 0.5,
-                                p_other_is_overseas = 0.5
+                                p_all_is_unknown_local = rep(0.5, n_states),
+                                p_other_is_overseas = rep(0.5, n_states)
                               ))[[1]]
 some_cases_known <- which(known_cases_vals > 0)
 
@@ -426,135 +546,82 @@ unknown_local_reporting_latest <- unknown_local_reporting[n_times, ]
 known_local_reporting_latest <- known_local_reporting[n_times, ]
 all_sources_reporting_latest <- all_sources_reporting[n_times, ]
 
-# 
-# 
-# 
-# # summarise (posterior mean and 95% CI) and plot a single vector greta array as
-# # a timeseries
-# plot_ts <- function (ts, draws) {
-#   draws_pred <- calculate(ts, values = draws)
-#   draws_mat <- as.matrix(draws_pred)
-#   mn <- colMeans(draws_mat)
-#   not_missing <- !is.na(mn)
-#   quants <- apply(draws_mat[, not_missing], 2, quantile, c(0.025, 0.975))
-#   plot(mn[not_missing] ~ times[not_missing], type = "l", ylim = c(0, 1))
-#   lines(quants[1, ] ~ times[not_missing], lty = 2)
-#   lines(quants[2, ] ~ times[not_missing], lty = 2)
-# }
-# 
-# plot_ts(unknown_local_reporting_nat, draws)
-# plot_ts(known_local_reporting_nat, draws)
-# plot_ts(all_sources_reporting_nat, draws)
+# report these in three side-by-side forest plots, using the code below
 
-png("reporting_rate_timeseries_by_state.png",
-    width = 1200,
-    height = 1800,
+# predict each national aggregate timeseries for each source
+all_sources_nat_sry <- summarise_samples(all_sources_reporting_nat, draws)
+known_local_nat_sry <- summarise_samples(known_local_reporting_nat, draws)
+unknown_local_nat_sry <- summarise_samples(unknown_local_reporting_nat, draws)
+
+# vector of death times for plotting
+death_vec <- rowSums(deaths)
+death_times <- times[death_vec > 0]
+death_counts <- death_vec[death_times]
+death_jitter <- jitter(rep(death_times, death_counts))
+
+
+# plot timeseries for two sources and overall in forest plots
+png("reporting_rate_timeseries_national.png",
+    width = 1500,
+    height = 500,
     pointsize = 30)
-par(mfrow = c(4, 2),
+par(mfrow = c(1, 3),
     mar = c(5, 4, 4, 3))
 
-# givena  vector greta array for a timeseries of values, return the posterior
-# mean, 95% credible interval, and posterior interquartile range
-summarise_timeseries <- function(ts, draws) {
-  draws <- calculate(ts, values = draws)
-  draws_mat <- as.matrix(draws)
-  list(
-    mean = colMeans(draws_mat),
-    ci = apply(draws_mat, 2, quantile, c(0.025, 0.975)),
-    iqr = apply(draws_mat, 2, quantile, c(0.25, 0.75))
-  )
-}
+plot_timeseries(all_sources_nat_sry, "all cases", death_jitter)
+plot_timeseries(known_local_nat_sry, "local transmission - known source", death_jitter)
+plot_timeseries(unknown_local_nat_sry, "local transmission - unknown source", death_jitter)
 
-
-state_names <- colnames(deaths)
-for (i in seq_len(n_states)) {
-  
-  # subset to the time after the state's first case
-  start <- which(known_cases_vals[, i] > 0)[1]
-  index <- start:n_times
-  times_plot <- times[index]
-  
-  # predict each state's timeseries for the all-sources reporting rate
-  all_sources_sry <- summarise_timeseries(
-    all_sources_reporting[index, i],
-    draws
-  )
-
-  mean <- all_sources_sry$mean
-  ci <- all_sources_sry$ci
-  iqr <- all_sources_sry$iqr
-  
-  plot(mean ~ times_plot, type = "n",
-       ylim = c(0, 1),
-       xlim = range(times),
-       axes = FALSE,
-       xlab = "date of symptomatic case report",
-       ylab = "probability of detection")
-  polygon(x = c(times_plot, rev(times_plot)),
-          y = c(ci[1, ], rev(ci[2, ])),
-          col = blues9[2], lty = 0)
-  polygon(x = c(times_plot, rev(times_plot)),
-          y = c(iqr[1, ], rev(iqr[2, ])),
-          col = blues9[3], lty = 0)
-  lines(mean ~ times_plot, lwd = 4, col = blues9[6])
-  axis(2, las = 2)
-  
-  # subtract 13 days from dates to reflect the date at which symptomatic would
-  # have been detected
-  first_date <- min(aus_timeseries$date - 13)
-  times_axis <- seq(1, n_times, length.out = 5)
-  axis(1, at = times_axis, labels = first_date + times_axis - 1)
-  
-  
-  title(main = state_names[i])
-  abline(v = times_plot[1], lwd = 1.5, col = "red")
-  text(x = times_plot[1], y = 1.08,
-       labels = "first case reported",
-       xpd = NA, col = "red", cex = 0.8)
-  
-  # add dates of recorded deaths in upper rug plot 
-  death_times <- times_plot[deaths[times_plot, i] > 0]
-  if (length(death_times) > 0) {
-    rug(death_times, side = 1, lwd = 2)
-    text(x = max(times_plot), y = -0.02,
-         labels = "deaths",pos = 4,
-         xpd = NA, cex = 0.8)
-  }
-  
-}
 dev.off()
 
-# calculate latest estimates
-draws <- calculate(reporting_rate_smooth[n_times, ], values = draws)
-draws_mat <- as.matrix(draws)
-colnames(draws_mat) <- state_names
-library(bayesplot)
-library(ggplot2)
-bayesplot::color_scheme_set("blue")
-bayesplot::mcmc_intervals(draws_mat, point_est = "mean", prob = 0.5, prob_outer = 0.95) +
-  ggplot2::xlim(0, 1) +
-  ggplot2::theme_minimal() +
-  ggplot2::ggtitle(paste("estimated reporting rates for symptomatic cases\non",
-                         max(aus_timeseries$date - 13),
-                         "(the latest available data)"))
-ggplot2::ggsave("latest_reporting_rates.png", scale = 1)
+# posterior summaries of the latest rates by stransmission source for each state
+all_sources_latest_sry <- summarise_samples(all_sources_reporting_latest, draws)
+known_local_latest_sry <- summarise_samples(known_local_reporting_latest, draws)
+unknown_local_latest_sry <- summarise_samples(unknown_local_reporting_latest, draws)
 
-reporting_rate <- data.frame(mean = colMeans(draws_mat),
-                             lower_50 = apply(draws_mat, 2, quantile, 0.25),
-                             upper_50 = apply(draws_mat, 2, quantile, 0.75),
-                             lower_95 = apply(draws_mat, 2, quantile, 0.025),
-                             upper_95 = apply(draws_mat, 2, quantile, 0.975))
+p1 <- forest_plot(all_sources_latest_sry,
+                  list("all cases", waiver()))
+p2 <- forest_plot(known_local_latest_sry,
+                  list("local transmission", "known source"),
+                  labels = FALSE)
+p3 <- forest_plot(unknown_local_latest_sry,
+              list("local transmission", "unknown source"),
+              labels = FALSE)
 
-write.csv(reporting_rate,
-          "latest_reporting_rates.csv",
+p1 + p2 + p3 + plot_annotation(title = paste("reporting rates as of", max(aus_timeseries$date - 13)))
+ggsave("latest_reporting_rates_by_source.png")
+
+
+# format outputs
+all_sources_df <- format_summary(all_sources_latest_sry)
+known_local_df <- format_summary(known_local_latest_sry)
+unknown_local_df <- format_summary(unknown_local_latest_sry)
+
+df <- rbind(
+  cbind(source = "all cases", all_sources_df),
+  cbind(source = "known local", known_local_df),
+  cbind(source = "unknown local", unknown_local_df)
+)
+
+write.csv(df,
+          "latest_reporting_rates_by_source.csv",
           row.names = FALSE)
-knitr::kable(round(reporting_rate, 3))
+knitr::kable(df, digits = 3)
 
-# compute a national estimate
-weights <- colSums(cases_known_matrix)
-weights <- weights / sum(weights)
-national_reporting_rate_estimate <- reporting_rate_smooth %*% as.matrix(weights)
-draws_national <- calculate(national_reporting_rate_estimate[n_times], values = draws)
-draws_national_vec <- as.matrix(draws_national)[, 1]
-c(mean = mean(draws_national_vec), quantile(draws_national_vec, c(0.25, 0.75, 0.025, 0.975)))
+# get national latest figure
 
+latest_national <- c(all_sources_reporting_nat[n_times], known_local_reporting_nat[n_times], unknown_local_reporting_nat[n_times])
+sry <- summarise_samples(latest_national, draws)
+nat_df <- data.frame(
+  source = c("all cases", "known local", "unknown local"),
+  mean = sry$mean,
+  lower_50 = sry$iqr[1, ],
+  upper_50 = sry$iqr[2, ],
+  lower_95 = sry$ci[1, ],
+  upper_95 = sry$ci[2, ]
+)
+rownames(nat_df) <- NULL
+write.csv(nat_df,
+          "latest_reporting_rates_by_source_national.csv",
+          row.names = FALSE)
+knitr::kable(nat_df, digits = 3)
