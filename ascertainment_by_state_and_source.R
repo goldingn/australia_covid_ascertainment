@@ -1,9 +1,9 @@
 # Time-series estimates of reporting rates for Australian states
 
 # load misc functions
-source("load_data.R")
-source("modelling_functions.R")
-source("output_functions.R")
+source("functions/load_data.R")
+source("functions/modelling_functions.R")
+source("functions/output_functions.R")
 
 # get timeseries of cases and deaths, by state and - where available - source
 aus_timeseries <- load_aus_timeseries()
