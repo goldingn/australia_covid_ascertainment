@@ -36,20 +36,21 @@ load_cases_and_deaths_by_state <- function() {
 
 load_cases_by_source_and_state <- function() {
   
-  require(gert)
+  require(processx)
   require(dplyr)
   require(tibble)
   require(purrr)
   
-  # clone Chris' git repo to download the data
+  # use Chris' git repo (included as a submodule) to download the data
+  python <- switch(Sys.info()["user"],
+                   nick = "/Users/nick/miniconda3/bin/python",
+                   "python")
 
-  # create a temporary directory to download data, and delete on exit
-  dir.create(tmp <- tempfile())
-  on.exit(unlink(tmp))
-  gert::git_clone("https://github.com/cmbaker00/covid19data.git", path = tmp)
+  # scrape data into the submodule
+  processx::run(python, "scrape_data.py", wd = "covid19data")
   
   # find the csv files
-  files <- list.files(tmp, pattern = ".csv$", full.names = TRUE)
+  files <- list.files("covid19data/", pattern = ".csv$", full.names = TRUE)
 
   # compile information on the datasets
   datasets <- tibble::as_tibble(

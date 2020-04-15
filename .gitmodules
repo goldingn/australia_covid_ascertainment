@@ -1,0 +1,4 @@
+[submodule "covid19data"]
+	path = covid19data
+	url = https://github.com/cmbaker00/covid19data.git
+	ignore = dirty
