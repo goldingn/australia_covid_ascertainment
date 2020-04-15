@@ -10,5 +10,9 @@ The analysis here replaces the method used for the global estimates linked to ab
   - Temporal variation is modelled as a Gaussian process, with uncertainty in the lengthscale parameters ('wiggliness' over time) accounted for by MCMC
   - This analysis infers different ascertainment rate timeseries for each Australian state and territory, but with information shared between them via a hierarchical Gaussian process prior.
 
-The main analysis, which models different timeseries of reporting rates for each state is in the script `ascertainment_by_state.R`. The script `ascertainment_by_state_and_source.R` contains an experimental analysis that attempts to disaggregate this reporting rate by different sources of transmission: overseas-acquired; locally-acquired where the source is known; and locally-acquired where the source is unknown. Because that analysis relies on a dataset that is incomplete, it uses Bayesian imputation to infer the missing data. The script `impute_cases_by_source.R` performs this imputation alone, and outputs simulated timeseries of case counts disaggregated by source, in case they are of use to other modellers.
+The main analysis, which models different timeseries of reporting rates for each state is in the script `ascertainment_by_state.R`.
+
+The script `ascertainment_by_state_and_source.R` contains an experimental analysis that attempts to disaggregate this reporting rate by different sources of transmission: overseas-acquired; locally-acquired where the source is known; and locally-acquired where the source is unknown. Because that analysis relies on a dataset that is incomplete, it uses Bayesian imputation to infer the missing data.
+
+The script `impute_cases_by_source.R` performs just the imputation part of this model, and outputs simulated timeseries of case counts disaggregated by source, in case they are of use to other modellers.
 
