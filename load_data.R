@@ -1,5 +1,40 @@
-# load and format data on timeseries of cases by source, in each state
-load_data <- function () {
+# load and format public data on cases in each state
+
+load_aus_timeseries <- function() {
+  
+  # load data from covid19data.org.au (scraped by Chris Baker) with cases by
+  # source for some states.
+  source_data <- load_cases_by_source_and_state()
+  
+  # subset the case data to Aus states
+  aus <- load_cases_and_deaths_by_state()
+  
+  # expand the type of count for each state, attach the sources where known, and
+  # compute cases with known outcomes
+  aus %>%
+    tidyr::pivot_wider(names_from = type, values_from = count) %>%
+    select(-recovered, cases = confirmed, deaths = death) %>%
+    left_join(source_data) %>%
+    mutate_at(c("cases", "deaths", "overseas", "known_local", "unknown_local", "other"),
+              ~ pmax(., 0))
+  
+}
+
+# download the latest Johns Hopkins data (it's in the package directly, so need
+# to reinstall regularly) and subset/format to Australia
+load_cases_and_deaths_by_state <- function() {
+  
+  require(dplyr)
+  
+  remotes::install_github("RamiKrispin/coronavirus", upgrade = "never")
+  coronavirus::coronavirus %>%
+    filter(Country.Region == "Australia") %>%
+    transmute(state = Province.State, date, count = cases, type) %>%
+    group_by(state)
+}
+
+
+load_cases_by_source_and_state <- function() {
   
   require(gert)
   require(dplyr)
@@ -96,48 +131,5 @@ load_dataset <- function (state, path, cumulative) {
 difference <- function (x) {
   c(0, diff(x))
 }
-
-# horrifyingly long working to get ballpark translation to detection rate for local transmissions
-
-# total_rate = reported / all 
-# reported = local_rate * local + import
-# all = local + import
-# 
-# total_rate = (local_rate * local + import) / (local + import)
-# local_apparent = local_rate * local
-# local = local_apparent / local_rate
-# 
-# total_rate = (local_apparent + import) / (import + local_apparent / local_rate)
-# all_apparent = local_apparent + import
-# 
-# total_rate = all_apparent / (import + local_apparent / local_rate)
-# import + local_apparent / local_rate = all_apparent / total_rate
-# local_apparent / local_rate = all_apparent / total_rate - import
-# 
-# local_rate = local_apparent / (all_apparent / total_rate - import)
-# import = all_apparent - local_apparent
-# 
-# local_rate = local_apparent / (all_apparent / total_rate - all_apparent + local_apparent)
-# local_rate = local_apparent / (all_apparent / total_rate - total_rate * all_apparent / total_rate + total_rate * local_apparent / total_rate)
-# local_rate = local_apparent / ((all_apparent - total_rate * all_apparent + total_rate * local_apparent)  / total_rate)
-# local_rate = local_apparent / (all_apparent * (1 - total_rate + total_rate * local_apparent / all_apparent)  / total_rate)
-# 
-# prop_apparent_local <- local_apparent / all_apparent  
-# local_rate = local_apparent / (all_apparent * (1 - total_rate + total_rate * prop_apparent_local)  / total_rate)
-# 
-# local_rate = total_rate * local_apparent / (all_apparent * (1 - total_rate + total_rate * prop_apparent_local))
-# local_rate = total_rate * prop_apparent_local / (1 - total_rate + total_rate * prop_apparent_local)
-# 
-# local_rate = prop_apparent_local / (prop_apparent_local - 1 + 1 / total_rate)
-# local_rate = prop_apparent_local / (prop_apparent_local + (1 - total_rate) / total_rate)
-
-
-prop_apparent_local <- 1/3
-total_rate <- 0.93
-(local_rate <- prop_apparent_local / (prop_apparent_local + (1 - total_rate) / total_rate))
-
-local_apparent = 10
-all_apparent = 30
-import = 20
 
 

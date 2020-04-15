@@ -5,32 +5,11 @@ source("load_data.R")
 source("modelling_functions.R")
 source("output_functions.R")
 
-# download the latest Johns Hopkins data (it's in the package directly, so need
-# to reinstall regularly)
-remotes::install_github("RamiKrispin/coronavirus", upgrade = "never")
-library(coronavirus)
-
-# load data from covid19data.org.au (scraped by Chris Baker) with cases by
-# source for some states.
-source_data <- load_data()
-
-# subset the case data to Aus states
 library(dplyr)
-aus <- coronavirus %>%
-  filter(Country.Region == "Australia") %>%
-  transmute(state = Province.State, date, count = cases, type) %>%
-  group_by(state)
 
-# expand the type of count for each state, attach the sources where known, and
-# compute cases with known outcomes
-aus_timeseries <- aus %>%
-  tidyr::pivot_wider(names_from = type, values_from = count) %>%
-  select(-recovered, cases = confirmed, deaths = death) %>%
-  left_join(source_data) %>%
-  mutate_at(c("cases", "deaths", "overseas", "known_local", "unknown_local", "other"),
-            ~ pmax(., 0))
+# get timeseries of cases and deaths, by state and - where available - source
+aus_timeseries <- load_aus_timeseries()
   
-
 # get date-by-state matrices for daily case counts by state for each source
 
 # deaths and all cases (as in Johns Hopkins data)
@@ -56,7 +35,6 @@ library(greta.gp)
 n_states <- ncol(deaths)
 n_times <- nrow(deaths)
 times <- seq_len(n_times)
-
 
 # estimating those parameters directly as with this model, the numbers are so
 # large there's essentially no uncertainty on them. Could relax the model a bit
