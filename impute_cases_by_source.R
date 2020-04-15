@@ -100,3 +100,7 @@ overseas_cases_discrete_sims <- set_known_counts(
   date_state_matrices$overseas_cases_raw
 )
 
+# save outputs
+saveRDS(unknown_local_cases_discrete_sims, "outputs/unknown_local_cases_imputed.rds")
+saveRDS(known_local_cases_discrete_sims, "outputs/known_local_cases_imputed.rds")
+saveRDS(overseas_cases_discrete_sims, "outputs/overseas_cases_imputed.rds")
