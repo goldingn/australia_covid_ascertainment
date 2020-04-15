@@ -1,91 +1,17 @@
 # Time-series estimates of reporting rates for Australian states
 
-# probability that a case will have either died or recovered by a given day
-# post-hospitalisation
-probability <- function(day, mean_hdt = 13, median_hdt = 9.1) {
-  
-  # parameters of lognormal delay distribution
-  mu_hdt <- log(median_hdt)
-  sigma_hdt <- sqrt(2*(log(mean_hdt) - mu_hdt))
-  
-  # probability that the delay between hospitalisation and death is 'day' days
-  plnorm(day + 1, mu_hdt, sigma_hdt) - plnorm(day, mu_hdt, sigma_hdt)
-  
-}
+# load misc functions
+source("load_data.R")
+source("modelling_functions.R")
+source("output_functions.R")
 
-# compute the (non-cumulative) number of cases for which we would know the outcome
-cases_known_outcome <- function(daily_cases){
-  
-  n_days <- length(daily_cases)
-  days <- seq_len(n_days)
-  
-  # get a probability of delaying each of these number of days (starting from 0)
-  delay_probs <- probability(days - 1)
-  
-  # effective number of cases we would have known about
-  cases_known <- rep(0, n_days)
-  
-  # disaggregate these cases across subsequent days
-  for(day in days){
-    
-    days_ahead <- seq_len(n_days - day + 1) - 1
-    day_assign <- day + days_ahead
-    
-    # get the number of cases on each subsequent day (probabilities indexed from 1)
-    new_partial_cases <- daily_cases[day] * delay_probs[days_ahead + 1]
-    
-    # assign them
-    cases_known[day_assign] <- cases_known[day_assign] + new_partial_cases
-    
-  }
-  
-  cases_known
-  
-}
-
-# download the latest Johns Hopkins data (it's in the package directly, so need to reinstall regularly)
-remotes::install_github("RamiKrispin/coronavirus", upgrade = "never")
-library(coronavirus)
-
-# subset the data to Aus states
-library(dplyr)
-aus <- coronavirus %>%
-  filter(Country.Region == "Australia") %>%
-  transmute(state = Province.State, date, count = cases, type) %>%
-  group_by(state)
-
-# For each of the states, get the time series of cases, deaths, and expected
-# number of cases with known outcomes (remove any negative cases or deaths).
-aus_timeseries <- aus %>%
-  tidyr::pivot_wider(names_from = type, values_from = count) %>%
-  select(-recovered, cases = confirmed, deaths = death) %>%
-  mutate(cases = pmax(0, cases),
-         deaths = pmax(0, deaths)) %>%
+# get timeseries of cases and deaths, by state and - where available - source
+aus_timeseries <- load_aus_timeseries() %>%
   mutate(cases_known_outcome = cases_known_outcome(cases))
 
-# get wide form versions of the deaths, and cases with known outcomes
-death_table <- aus_timeseries %>%
-  select(-cases, -cases_known_outcome) %>%
-  tidyr::pivot_wider(names_from = state, values_from = deaths)
-
-death_matrix <- death_table %>%
-  select(-date) %>%
-  as.matrix
-
-cases_known_table <- aus_timeseries %>%
-  select(-cases, -deaths) %>%
-  tidyr::pivot_wider(names_from = state, values_from = cases_known_outcome)
-
-cases_known_matrix <- cases_known_table %>%
-  select(-date) %>%
-  as.matrix
-
-# check the dates match
-stopifnot(identical(death_table$date, cases_known_table$date))
-
-# check there are no deaths on days without cases that have known outcomes
-stopif <- function(expr) {stopifnot(!expr)}
-stopif(any(death_matrix > 0 & cases_known_matrix == 0))
+# deaths and all cases (as in Johns Hopkins data)
+death_matrix <- date_state_matrix("deaths", aus_timeseries)
+cases_known_matrix <- date_state_matrix("cases_known_outcome", aus_timeseries)
 
 # build model for contemporary observed number of deaths and expected number of
 # deaths:
@@ -93,13 +19,12 @@ stopif(any(death_matrix > 0 & cases_known_matrix == 0))
 #   expected_deaths_t = cases_known_outcomes_t * CFR_t
 #   CFR_t = baseline_CFR / reporting_rate_t
 
-library(greta)
+library(greta.gp)
 
 n_states <- ncol(death_matrix)
 n_times <- nrow(death_matrix)
 
 # a timeseries of reporting rates for each state, modelled as hierarchical Gaussian processes
-library(greta.gp)
 
 # squared-exponential GP kernels (plus intercepts) with unknown parameters for
 # the national and state-level processes. lognormal prior for lengthscales to
@@ -177,53 +102,6 @@ some_cases_known <- which(cases_known_matrix > 0)
 log_expected_deaths <- log_cfr[some_cases_known] +
   log(cases_known_matrix)[some_cases_known]
 expected_deaths <- exp(log_expected_deaths)
-
-# first, just split out overseas imports.
-
-# expected number of deaths is CFR * cases_known, where cases_known is the total
-# number of cases with known outcomes by this time, given by the number of known
-# imports + the number of non-imports divided by the reporting rate (since we
-# assume that the detection is now perfect for overseas imports)
-
-# expected_deaths = true_cfr * (known_imports + known_local_cases / reporting_rate)
-
-
-
-
-# in the more general case:
-
-# elementwise divide the matrix of known cases with known outcomes in each state
-# andcase type at each time by the reporting rate for each state and case type
-# for each time. Then sum over rows to get the modelled total 'true' number of
-# cases.
-
-# expected_deaths = true_cfr * aggregation_matrix %*% t(known_cases_matrix / reporting_rate_matrix)
-
-# where both known_cases_matrix and reporting_rate_matrix are matrices with
-# n_times x (n_states * n_types), and aggregation_matrix if a matrix of 1s and
-# 0s that sums over the types of cases within each state:
-
-# e.g.:
-# n_states <- 7
-# n_types <- 5
-# n_times <- 3
-# states <- rep(seq_len(n_states), each = n_types)
-# types <- rep(seq_len(n_types), n_states)
-# x <- matrix(rnorm(n_times * n_states * n_types), nrow = n_times)
-# 
-# aggregation <- outer(seq_len(n_states), states, FUN = "==")
-# aggregation[] <- as.integer(aggregation)
-# res <- aggregation %*% t(x)
-# 
-# # sanity check
-# tapply(x[1, ], states, FUN = "sum")
-# tapply(x[2, ], states, FUN = "sum")
-# tapply(x[3, ], states, FUN = "sum")
-
-# need to also to define probit-normal priors on the mean reporting rates for
-# different types, and apply these as normal priors on the intercept term (add
-# the mean, and use a bias kernel) (intercept).
-
 observed_deaths <- death_matrix[some_cases_known]
 distribution(observed_deaths) <- poisson(expected_deaths)
 
