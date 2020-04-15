@@ -5,104 +5,36 @@ source("load_data.R")
 source("modelling_functions.R")
 source("output_functions.R")
 
-library(dplyr)
-
 # get timeseries of cases and deaths, by state and - where available - source
 aus_timeseries <- load_aus_timeseries()
   
 # get date-by-state matrices for daily case counts by state for each source
+date_state_matrices <- get_date_state_matrices(aus_timeseries)
 
-# deaths and all cases (as in Johns Hopkins data)
-deaths <- date_state_matrix("deaths", aus_timeseries)
-cases <- date_state_matrix("cases", aus_timeseries)
+# unpack them
+deaths <- date_state_matrices$deaths
+unknown_local_cases <- date_state_matrices$unknown_local_cases
+known_local_cases <- date_state_matrices$known_local_cases
+overseas_cases <- date_state_matrices$overseas_cases
+p_all_is_unknown_local <- date_state_matrices$p_all_is_unknown_local
+p_other_is_overseas <- date_state_matrices$p_other_is_overseas
 
-# cases from each source, with some NAs
-unknown_local <- date_state_matrix("unknown_local", aus_timeseries)
-known_local <- date_state_matrix("known_local", aus_timeseries)
-overseas <- date_state_matrix("overseas", aus_timeseries)
-other <- date_state_matrix("other", aus_timeseries)
+# now disaggregate these cases using the delay distribution
+unknown_local <- cases_known_outcome_matrix(unknown_local_cases)
+known_local <- cases_known_outcome_matrix(known_local_cases)
+overseas <- cases_known_outcome_matrix(overseas_cases)
 
-# impute missing values
-
-# where no information is available (Queensland, or outside dates when sources
-# were reported), disaggregate into the fraction that are local with unknown
-# source and those that are 'other'; then disaggregate the 'other' into those
-# that are overseas-acquired, vs. local with known source. For WA, 'other' is
-# known, so just the second step.
-
+# define hierarchical probit-GPs for reporting rates of unknown local, and known
+# local cases. Assume reporting rate for overseas-acquired cases is perfect.
 library(greta.gp)
 
 n_states <- ncol(deaths)
 n_times <- nrow(deaths)
 times <- seq_len(n_times)
 
-# estimating those parameters directly as with this model, the numbers are so
-# large there's essentially no uncertainty on them. Could relax the model a bit
-# later (e.g. hierarchical model by state on the proportions), and infer them
-
-other_is_overseas_sigma <- normal(0, 0.5, truncation = c(0, Inf))
-other_is_overseas_mean <- normal(0, sqrt(0.5))
-other_is_overseas_raw <- normal(0, 1, dim = n_states)
-other_is_overseas_z <- other_is_overseas_mean + other_is_overseas_raw * other_is_overseas_sigma
-p_other_is_overseas <- iprobit(other_is_overseas_z)
-
-# # check prior on probability (slightly convex is fine, strong 'U' shape not so
-# # good)
-# hist(calculate(p_other_is_overseas[1], nsim = 10000)[[1]], breaks = 100)
-
-all_is_unknown_local_sigma <- normal(0, 0.5, truncation = c(0, Inf))
-all_is_unknown_local_mean <- normal(0, sqrt(0.5))
-all_is_unknown_local_raw <- normal(0, 1, dim = n_states)
-all_is_unknown_local_z <- all_is_unknown_local_mean + all_is_unknown_local_raw * all_is_unknown_local_sigma
-p_all_is_unknown_local <- iprobit(all_is_unknown_local_z)
-
-# get data to inform these, skipping some states for whichthere is no data
-state_names <- tibble::tibble(state = colnames(deaths))
-
-overseas_vs_other <- aus_timeseries %>%
-  select(overseas, known_local) %>%
-  na.omit() %>%
-  mutate(other = overseas + known_local) %>%
-  summarise(successes = sum(overseas),
-            trials = sum(other)) %>%
-  right_join(state_names)
-
-not_missing <- which(!is.na(overseas_vs_other$trials))
-distribution(overseas_vs_other$successes[not_missing]) <-
-  binomial(overseas_vs_other$trials[not_missing],
-           p_other_is_overseas[not_missing])
-
-unknown_local_vs_all <- aus_timeseries %>%
-  select(unknown_local, cases) %>%
-  na.omit() %>%
-  summarise(successes = sum(unknown_local),
-            trials = sum(cases)) %>%
-  right_join(state_names)
-
-not_missing <- which(!is.na(unknown_local_vs_all$trials))
-distribution(unknown_local_vs_all$successes[not_missing]) <-
-  binomial(unknown_local_vs_all$trials[not_missing],
-           p_all_is_unknown_local[not_missing])
-
-# fill in values
-unknown_local <- impute_values(unknown_local, cases, p_all_is_unknown_local)
-other <- impute_values(other, cases, 1 - p_all_is_unknown_local)
-overseas <- impute_values(overseas, other, p_other_is_overseas)
-known_local <- impute_values(known_local, other, 1 - p_other_is_overseas)
-
-# now disaggregate these cases using the delay distribution
-unknown_local <- cases_known_outcome_matrix(unknown_local)
-known_local <- cases_known_outcome_matrix(known_local)
-overseas <- cases_known_outcome_matrix(overseas)
-
-# define hierarchical probit-GPs for reporting rates of unknown local, and known
-# local cases. Assume reporting rate for overseas-acquired cases is perfect.
-
 unknown_local_gp_lengthscale <- lognormal(4, 0.5)
 unknown_local_gp_sigma <- lognormal(-2, 0.5)
-unknown_local_sigma <- normal(0, 0.5, truncation = c(0, Inf))
-unknown_local_intercepts_raw <- normal(0, 1, dim = c(1, n_states))
-unknown_local_intercepts <- unknown_local_intercepts_raw * unknown_local_sigma
+unknown_local_intercepts <- hierarchical_normal(dim = n_states, mean_sd = NULL)
 unknown_local_gp <- temporal_gp(
   times = times,
   lengthscale = unknown_local_gp_lengthscale,
@@ -111,7 +43,7 @@ unknown_local_gp <- temporal_gp(
 )
 unknown_local_z <- kronecker(
   unknown_local_gp,
-  unknown_local_intercepts,
+  t(unknown_local_intercepts),
   FUN = "+"
 )
 unknown_local_reporting <- iprobit(unknown_local_z)
@@ -120,9 +52,7 @@ unknown_local_reporting <- iprobit(unknown_local_z)
 # shrinkage is towards no difference
 known_diff_gp_lengthscale <- lognormal(4, 0.5)
 known_diff_gp_sigma <- lognormal(-2, 0.5)
-known_diff_sigma <- normal(0, 0.5, truncation = c(0, Inf))
-known_diff_intercepts_raw <- normal(0, 1, dim = n_states)
-known_diff_intercepts <- known_diff_intercepts_raw * known_diff_sigma
+known_diff_intercepts <- hierarchical_normal(dim = n_states, mean_sd = NULL)
 known_diff_gp <- temporal_gp(
   times = times,
   lengthscale = known_diff_gp_lengthscale,
@@ -186,10 +116,8 @@ m <- model(
   baseline_cfr_perc,
   unknown_local_gp_lengthscale,
   unknown_local_gp_sigma,
-  unknown_local_sigma,
   known_diff_gp_lengthscale,
-  known_diff_gp_sigma,
-  known_diff_sigma
+  known_diff_gp_sigma
 )
 
 n_chains <- 10

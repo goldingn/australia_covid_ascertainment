@@ -201,3 +201,96 @@ summarise_samples <- function(ts, draws) {
     iqr = apply(draws_mat, 2, quantile, c(0.25, 0.75))
   )
 }
+
+get_date_state_matrices <- function(aus_timeseries) {
+  
+  require(dplyr)
+  require(greta)
+  
+  # deaths and all cases (as in Johns Hopkins data)
+  deaths <- date_state_matrix("deaths", aus_timeseries)
+  cases <- date_state_matrix("cases", aus_timeseries)
+  
+  # cases from each source, with some NAs
+  unknown_local <- date_state_matrix("unknown_local", aus_timeseries)
+  known_local <- date_state_matrix("known_local", aus_timeseries)
+  overseas <- date_state_matrix("overseas", aus_timeseries)
+  other <- date_state_matrix("other", aus_timeseries)
+  
+  # impute missing values
+  
+  # where no information is available (Queensland, or outside dates when sources
+  # were reported), disaggregate into the fraction that are local with unknown
+  # source and those that are 'other'; then disaggregate the 'other' into those
+  # that are overseas-acquired, vs. local with known source. For WA, 'other' is
+  # known, so just the second step.
+  
+  n_states <- ncol(deaths)
+  
+  other_is_overseas_z <- hierarchical_normal(n_states)
+  p_other_is_overseas <- iprobit(other_is_overseas_z)
+  
+  all_is_unknown_local_z <- hierarchical_normal(n_states)
+  p_all_is_unknown_local <- iprobit(all_is_unknown_local_z)
+  
+  # # check prior on probability (slightly convex is fine, strong 'U' shape not so
+  # # good)
+  # hist(calculate(p_other_is_overseas[1], nsim = 10000)[[1]], breaks = 100)
+  
+  # get data to inform these, skipping some states for whichthere is no data
+  state_names <- tibble::tibble(state = colnames(deaths))
+  
+  overseas_vs_other <- aus_timeseries %>%
+    select(overseas, known_local) %>%
+    na.omit() %>%
+    mutate(other = overseas + known_local) %>%
+    summarise(successes = sum(overseas),
+              trials = sum(other)) %>%
+    right_join(state_names)
+  
+  not_missing <- which(!is.na(overseas_vs_other$trials))
+  distribution(overseas_vs_other$successes[not_missing]) <-
+    binomial(overseas_vs_other$trials[not_missing],
+             p_other_is_overseas[not_missing])
+  
+  unknown_local_vs_all <- aus_timeseries %>%
+    select(unknown_local, cases) %>%
+    na.omit() %>%
+    summarise(successes = sum(unknown_local),
+              trials = sum(cases)) %>%
+    right_join(state_names)
+  
+  not_missing <- which(!is.na(unknown_local_vs_all$trials))
+  distribution(unknown_local_vs_all$successes[not_missing]) <-
+    binomial(unknown_local_vs_all$trials[not_missing],
+             p_all_is_unknown_local[not_missing])
+  
+  # fill in values
+  unknown_local <- impute_values(unknown_local, cases, p_all_is_unknown_local)
+  other <- impute_values(other, cases, 1 - p_all_is_unknown_local)
+  overseas <- impute_values(overseas, other, p_other_is_overseas)
+  known_local <- impute_values(known_local, other, 1 - p_other_is_overseas)
+  
+  # return matrices (or greta arrays) for the imputed case counts, and the two
+  # parameter vectors
+  list(deaths = deaths,
+       overseas_cases = overseas,
+       known_local_cases = known_local,
+       unknown_local_cases = unknown_local,
+       p_all_is_unknown_local = p_all_is_unknown_local,
+       p_other_is_overseas = p_other_is_overseas)
+  
+}
+
+# generate a vector of length 'dim', with hierarchical normal prior
+hierarchical_normal <- function(dim, sigma_sd = 0.5, mean_sd = sqrt(0.5)) {
+  sigma <- normal(0, sigma_sd, truncation = c(0, Inf))
+  if (is.null(mean_sd)) {
+    mean <- 0
+  } else {
+    mean <- normal(0, mean_sd)
+  }
+  raw <- normal(0, 1, dim = dim)
+  mean + raw * sigma
+}
+
