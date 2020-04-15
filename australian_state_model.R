@@ -13,9 +13,9 @@ date_state_matrices <- get_date_state_matrices(aus_timeseries)
 
 # unpack them
 deaths <- date_state_matrices$deaths
-unknown_local_cases <- date_state_matrices$unknown_local_cases
-known_local_cases <- date_state_matrices$known_local_cases
-overseas_cases <- date_state_matrices$overseas_cases
+unknown_local_cases <- date_state_matrices$unknown_local_cases_imputed
+known_local_cases <- date_state_matrices$known_local_cases_imputed
+overseas_cases <- date_state_matrices$overseas_cases_imputed
 p_all_is_unknown_local <- date_state_matrices$p_all_is_unknown_local
 p_other_is_overseas <- date_state_matrices$p_other_is_overseas
 

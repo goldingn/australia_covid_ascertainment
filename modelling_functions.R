@@ -266,19 +266,29 @@ get_date_state_matrices <- function(aus_timeseries) {
              p_all_is_unknown_local[not_missing])
   
   # fill in values
-  unknown_local <- impute_values(unknown_local, cases, p_all_is_unknown_local)
-  other <- impute_values(other, cases, 1 - p_all_is_unknown_local)
-  overseas <- impute_values(overseas, other, p_other_is_overseas)
-  known_local <- impute_values(known_local, other, 1 - p_other_is_overseas)
+  unknown_local_imputed <- impute_values(unknown_local, cases, p_all_is_unknown_local)
+  other_imputed <- impute_values(other, cases, 1 - p_all_is_unknown_local)
+  overseas_imputed <- impute_values(overseas, other_imputed, p_other_is_overseas)
+  known_local_imputed <- impute_values(known_local, other_imputed, 1 - p_other_is_overseas)
   
   # return matrices (or greta arrays) for the imputed case counts, and the two
   # parameter vectors
-  list(deaths = deaths,
-       overseas_cases = overseas,
-       known_local_cases = known_local,
-       unknown_local_cases = unknown_local,
-       p_all_is_unknown_local = p_all_is_unknown_local,
-       p_other_is_overseas = p_other_is_overseas)
+  list(
+    # true counts
+    deaths = deaths,
+    cases = cases,
+    # unimputed case counts by source
+    overseas_cases_raw = overseas,
+    known_local_cases_raw = known_local,
+    unknown_local_cases_raw = unknown_local,
+    # greta arrays for imputed casee counts by source
+    overseas_cases_imputed = overseas_imputed,
+    known_local_cases_imputed = known_local_imputed,
+    unknown_local_cases_imputed = unknown_local_imputed,
+    # imputation parameters
+    p_all_is_unknown_local = p_all_is_unknown_local,
+    p_other_is_overseas = p_other_is_overseas
+  )
   
 }
 
@@ -292,5 +302,45 @@ hierarchical_normal <- function(dim, sigma_sd = 0.5, mean_sd = sqrt(0.5)) {
   }
   raw <- normal(0, 1, dim = dim)
   mean + raw * sigma
+}
+
+# get a simulation * date * state array of posterior estimates of a
+# date-by-state matrix, possibly simulating the values
+get_date_state_sims <- function(matrix, draws, nsim = 1000, simulate = FALSE) {
+  
+  if (simulate) {
+    pred_array <- calculate(matrix, values = draws, nsim = nsim)[[1]]
+  } else {
+    pred_draws <- calculate(matrix, values = draws)
+    pred_array <- as.matrix(pred_draws)
+    keep <- sample.int(nrow(pred_array), nsim)
+    pred_array <- pred_array[keep, ]
+    dim(pred_array) <- c(nrow(pred_array), nrow(matrix), ncol(matrix))
+  }
+  
+  pred_array
+}
+
+# given an array of imputed case counts, where each slice along the first
+# dimension is a date*state matrix, and a date*state matrix of raw data - with
+# known counts in some scells and NAs where counts are unknown, mask the imputed
+# case array so that known counts are set to their known values. Also apply the
+# matrix row/column names to the array slices
+set_known_counts <- function(imputed_array, raw_matrix) {
+  
+  not_missing <- !is.na(raw_matrix)
+  not_missing_values <- raw_matrix[not_missing]
+  n_sims <- dim(imputed_array)[1]
+  sims <- seq_len(n_sims)
+  for (sim in sims) {
+    imputed_array[sim, , ][not_missing] <- not_missing_values
+  }
+  
+  sims <- paste0("sim", sims)
+  states <- colnames(raw_matrix)
+  dates <- rownames(raw_matrix)
+  dimnames(imputed_array) <- list(sims, dates, states)
+  imputed_array
+  
 }
 
